@@ -1,0 +1,17 @@
+{
+    "name": "isidorus",
+    "private": true,
+    "workspaces": [
+        "packages/*"
+    ],
+    "scripts": {
+        "build": "npm run build --workspaces=packages/*",
+        "test": "npm run test --workspaces=packages/*",
+        "version": "changeset version",
+        "publish-packages": "changeset publish"
+    },
+    "devDependencies": {
+        "@changesets/cli" : "^2.27.0",
+        "typescript": "^5.4.0"
+    }
+}
