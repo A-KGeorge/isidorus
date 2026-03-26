@@ -96,7 +96,7 @@ export class Graph {
 
   /** Total number of ops in the graph. */
   get numOps(): number {
-    return this._native.numOps as number;
+    return this._native.numOps() as number;
   }
 
   /**

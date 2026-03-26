@@ -86,17 +86,11 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
     if (info.Length() >= 4 && info[3].IsString())
         op_name = info[3].As<Napi::String>().Utf8Value();
 
-    StatusGuard status;
-    TF_OperationDescription *desc = TF_NewOperation(graph_, op_type.c_str(), op_name.c_str());
-
-    if (!desc)
-    {
-        Napi::Error::New(env, "TF_NewOperation failed for type " + op_type).ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-
-    // Add inputs.
+    // Resolve inputs first so we can retry op construction with TF_AddInputList
+    // for list-input ops (e.g. IdentityN) when needed.
+    std::vector<TF_Output> resolved_inputs;
     auto inputs_arr = info[1].As<Napi::Array>();
+    resolved_inputs.reserve(inputs_arr.Length());
     for (uint32_t i = 0; i < inputs_arr.Length(); i++)
     {
         auto input_obj = inputs_arr.Get(i).As<Napi::Object>();
@@ -109,11 +103,13 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             Napi::Error::New(env, "Input op not found: " + input_op_name).ThrowAsJavaScriptException();
             return env.Undefined();
         }
-        TF_AddInput(desc, {input_op, input_idx});
+        resolved_inputs.push_back({input_op, input_idx});
     }
 
-    if (info.Length() >= 3 && info[2].IsObject())
+    auto apply_attrs = [&](TF_OperationDescription *desc) -> bool
     {
+        if (!(info.Length() >= 3 && info[2].IsObject()))
+            return true;
 
         enum class AttrKind
         {
@@ -228,15 +224,65 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             case AttrKind::Unknown:
             default:
                 Napi::Error::New(env, "Unsupported attr kind: " + kind_str).ThrowAsJavaScriptException();
-                return env.Undefined();
+                return false;
             }
         }
+        return true;
+    };
+
+    auto finish_op = [&](bool add_as_input_list, std::string &error_out) -> TF_Operation *
+    {
+        StatusGuard status;
+        TF_OperationDescription *desc = TF_NewOperation(graph_, op_type.c_str(), op_name.c_str());
+        if (!desc)
+        {
+            error_out = "TF_NewOperation failed for type " + op_type;
+            return nullptr;
+        }
+
+        if (add_as_input_list)
+        {
+            if (!resolved_inputs.empty())
+                TF_AddInputList(desc, resolved_inputs.data(), static_cast<int>(resolved_inputs.size()));
+        }
+        else
+        {
+            for (const auto &input : resolved_inputs)
+                TF_AddInput(desc, input);
+        }
+
+        if (!apply_attrs(desc))
+            return nullptr;
+
+        TF_Operation *op = TF_FinishOperation(desc, status.s);
+        if (!status.ok() || !op)
+        {
+            error_out = status.message();
+            return nullptr;
+        }
+        return op;
+    };
+
+    std::string first_error;
+    TF_Operation *op = finish_op(false, first_error);
+
+    // Some ops have a single list-valued input arg and reject repeated
+    // TF_AddInput calls even for one element; retry with TF_AddInputList.
+    if (!op && first_error.find("expected list") != std::string::npos &&
+        !resolved_inputs.empty())
+    {
+        std::string retry_error;
+        op = finish_op(true, retry_error);
+        if (!op)
+            first_error = retry_error;
     }
 
-    TF_Operation *op = TF_FinishOperation(desc, status.s);
-    if (!status.ok() || !op)
+    if (!op)
     {
-        Napi::Error::New(env, "TF_FinishOperation failed for " + op_type + ": " + status.message()).ThrowAsJavaScriptException();
+        if (!env.IsExceptionPending())
+        {
+            Napi::Error::New(env, "TF_FinishOperation failed for " + op_type + ": " + first_error).ThrowAsJavaScriptException();
+        }
         return env.Undefined();
     }
 

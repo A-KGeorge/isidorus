@@ -38,7 +38,6 @@
 import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
 import { availableParallelism } from "os";
 import { statSync } from "fs";
-import { fileURLToPath } from "url";
 import { performance } from "perf_hooks";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -287,32 +286,112 @@ export class InferencePool {
   ): Promise<InferencePool> {
     const ctrlSab = new SharedArrayBuffer(concurrency * CTRL_SLOTS * 4);
     const slots: WorkerSlot[] = [];
-    const __filename = fileURLToPath(import.meta.url);
+    const startedWorkers: Worker[] = [];
+    const workerEntrypoint = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { performance } = require("node:perf_hooks");
+const { join } = require("node:path");
 
-    for (let i = 0; i < concurrency; i++) {
-      const ctrl = new Int32Array(ctrlSab, i * CTRL_SLOTS * 4, CTRL_SLOTS);
-      Atomics.store(ctrl, 0, IDLE);
+const IDLE = 0;
+const WORK = 1;
+const DONE = 2;
+const SHUTDOWN = 3;
+const CTRL_SLOTS = 4;
 
-      const worker = new Worker(__filename, {
-        workerData: {
-          ctrlSab,
-          workerIndex: i,
-          modelPath: opts.modelPath,
-          inputOp: opts.inputOp,
-          outputOps: opts.outputOps,
-          reserveCores, // passed to worker for future native session
-        },
-      });
+(async () => {
+  try {
+    if (process.platform === "win32") {
+      const libtfPath = process.env.LIBTENSORFLOW_PATH || "C:\\\\libtensorflow";
+      const dllDir = libtfPath.toLowerCase().endsWith("\\\\lib")
+        ? libtfPath
+        : join(libtfPath, "lib");
+      const currentPath = process.env.Path || process.env.PATH || "";
+      const nextPath = dllDir + ";" + currentPath;
+      process.env.Path = nextPath;
+      process.env.PATH = nextPath;
+    }
 
-      await new Promise<void>((resolve, reject) => {
-        worker.once("message", (msg: any) => {
-          if (msg.type === "ready") resolve();
-          else reject(new Error(`Unexpected worker init: ${msg.type}`));
+    const { ctrlSab, workerIndex, modelPath, inputOp, outputOps } = workerData;
+    const ctrl = new Int32Array(ctrlSab, workerIndex * CTRL_SLOTS * 4, CTRL_SLOTS);
+
+    const { TFSession } = await import("jude-tf");
+    const sess = await TFSession.loadFrozenGraph(modelPath);
+
+    Atomics.store(ctrl, 0, IDLE);
+    parentPort.postMessage({ type: "ready" });
+
+    while (true) {
+      Atomics.wait(ctrl, 0, IDLE);
+      const state = Atomics.load(ctrl, 0);
+
+      if (state === SHUTDOWN) {
+        sess.destroy();
+        parentPort.postMessage({ type: "shutdown_ack" });
+        break;
+      }
+
+      if (state === WORK) {
+        const msg = await new Promise((resolve) => parentPort.once("message", resolve));
+        const t0 = performance.now();
+        const results = await sess.run({ [inputOp]: msg.inputData }, outputOps);
+        const inferenceMs = performance.now() - t0;
+
+        Atomics.store(ctrl, 0, DONE);
+        Atomics.notify(ctrl, 0, 1);
+
+        parentPort.postMessage({
+          type: "result",
+          outputs: outputOps.map((k) => results[k]),
+          inferenceMs,
         });
-        worker.once("error", reject);
-      });
 
-      slots.push({ worker, ctrl, busy: false, resolve: null, reject: null });
+        Atomics.store(ctrl, 0, IDLE);
+      }
+    }
+  } catch (err) {
+    parentPort.postMessage({
+      type: "init_error",
+      error: err && err.stack ? String(err.stack) : String(err),
+    });
+  }
+})();
+`;
+
+    try {
+      for (let i = 0; i < concurrency; i++) {
+        const ctrl = new Int32Array(ctrlSab, i * CTRL_SLOTS * 4, CTRL_SLOTS);
+        Atomics.store(ctrl, 0, IDLE);
+
+        const worker = new Worker(workerEntrypoint, {
+          eval: true,
+          workerData: {
+            ctrlSab,
+            workerIndex: i,
+            modelPath: opts.modelPath,
+            inputOp: opts.inputOp,
+            outputOps: opts.outputOps,
+            reserveCores,
+          },
+        });
+        startedWorkers.push(worker);
+
+        await new Promise<void>((resolve, reject) => {
+          worker.once("message", (msg: any) => {
+            if (msg.type === "ready") resolve();
+            else if (msg.type === "init_error") {
+              reject(new Error(`Worker init failed: ${msg.error}`));
+            } else reject(new Error(`Unexpected worker init: ${msg.type}`));
+          });
+          worker.once("error", reject);
+        });
+
+        slots.push({ worker, ctrl, busy: false, resolve: null, reject: null });
+      }
+    } catch (err) {
+      await Promise.allSettled(
+        startedWorkers.map((worker) => worker.terminate()),
+      );
+      throw err;
     }
 
     return new InferencePool({

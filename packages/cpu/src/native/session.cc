@@ -342,7 +342,11 @@ void SessionWrap::cleanup()
         session_ = nullptr;
     }
     graph_ = nullptr;
-    graph_ref_.Unref();
+
+    if (!graph_ref_.IsEmpty())
+    {
+        graph_ref_.Reset();
+    }
 }
 
 Napi::Value SessionWrap::IntraOpThreads(const Napi::CallbackInfo &info)
