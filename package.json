@@ -2,11 +2,12 @@
     "name": "isidorus",
     "private": true,
     "workspaces": [
-        "packages/*"
+        "packages/core",
+        "packages/cpu"
     ],
     "scripts": {
-        "build": "npm run build --workspace='packages/*'",
-        "test": "npm run test --workspace='packages/*'",
+        "build": "npm run build -ws",
+        "test": "npm run test -ws",
         "changeset": "changeset",
         "version": "changeset version",
         "publish-packages": "changeset publish"
