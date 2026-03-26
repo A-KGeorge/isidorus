@@ -69,7 +69,10 @@ jobs:
         with:
           # This will create a PR when changesets are found,
           # or publish to NPM if the version was bumped.
+          version: npm run version
           publish: npm run publish-packages
+          commit: "ci(release): version packages"
+          title: "ci(release): version packages"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }} # You must add this to GitHub Secrets
+          NPM_CONFIG_PROVENANCE: true
