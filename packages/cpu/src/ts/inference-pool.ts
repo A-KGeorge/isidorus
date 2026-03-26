@@ -116,7 +116,7 @@ if (!isMainThread) {
   parentPort!.postMessage({ type: "ready" });
 
   while (true) {
-    Atomics.wait(ctrl, 0, IDLE);
+    const { value } = await Atomics.waitAsync(ctrl, 0, IDLE);
     const state = Atomics.load(ctrl, 0);
 
     if (state === SHUTDOWN) {
@@ -141,7 +141,7 @@ if (!isMainThread) {
       const inferenceMs = performance.now() - t0;
 
       Atomics.store(ctrl, 0, DONE);
-      Atomics.notify(ctrl, 0, 1);
+      // Atomics.notify(ctrl, 0, 1);
 
       parentPort!.postMessage({
         type: "result",
@@ -149,7 +149,7 @@ if (!isMainThread) {
         inferenceMs,
       });
 
-      Atomics.store(ctrl, 0, IDLE);
+      // Atomics.store(ctrl, 0, IDLE);
     }
   }
 }
