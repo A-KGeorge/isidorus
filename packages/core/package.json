@@ -1,9 +1,9 @@
 {
     "name": "@isidorus/core",
-    "version": "0.0.1-alpha.0",
+    "version": "0.0.0-alpha.0",
     "description": "Shared types, tensor IR, and graph abstractions for isidorus",
     "type": "module",
-    "main" : "./dist/index.js",
+    "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "exports": {
         ".": {
@@ -14,13 +14,13 @@
     "scripts": {
         "build": "tsc",
         "build:watch": "tsc --watch",
-        "test": "node scripts/install.js",
+        "test": "node scripts/test.js",
         "test:clean": "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
-        "test:install": "node scripts/test-install.js"        
+        "test:install": "node scripts/test-install.js"
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/A-KGeorge/isidorus.git"
+        "url": "git+https://github.com/A-KGeorge/isidorus.git"
     },
     "publishConfig": {
         "access": "public",

@@ -1,0 +1,9 @@
+{
+  "mode": "pre",
+  "tag": "alpha",
+  "initialVersions": {
+    "@isidorus/core": "0.0.0-alpha.0",
+    "@isidorus/cpu": "0.0.0-alpha.0"
+  },
+  "changesets": []
+}
