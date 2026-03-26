@@ -5,8 +5,8 @@
         "packages/*"
     ],
     "scripts": {
-        "build": "npm run build -ws",
-        "test": "npm run test -ws",
+        "build": "npm run build --workspace='packages/*'",
+        "test": "npm run test --workspace='packages/*'",
         "changeset": "changeset",
         "version": "changeset version",
         "publish-packages": "changeset publish"
