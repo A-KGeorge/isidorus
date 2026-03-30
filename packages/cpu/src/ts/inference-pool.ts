@@ -329,7 +329,16 @@ export class InferencePool {
     // Forward the parent's execArgv (e.g. --import tsx) so the worker can
     // load TypeScript files when the test suite runs under tsx directly.
     // const workerExecArgv = resolveWorkerExecArgv();
-    const workerEntry = new URL("./inference-pool.ts", import.meta.url);
+    const isTsSource = import.meta.url.endsWith(".ts");
+    const workerEntry = isTsSource
+      ? new URL("./inference-pool-worker.mjs", import.meta.url)
+      : new URL("./inference-pool.js", import.meta.url);
+    // const workerExecArgv: string[] = [];
+
+    console.log("[createWorkerPool] import.meta.url:", import.meta.url);
+    console.log("[createWorkerPool] isTsSource:", isTsSource);
+    // console.log("[createWorkerPool] workerExecArgv:", workerExecArgv);
+    console.log("[createWorkerPool] workerEntry:", workerEntry.toString());
 
     try {
       for (let i = 0; i < concurrency; i++) {
@@ -345,6 +354,7 @@ export class InferencePool {
             outputOps: opts.outputOps,
             reserveCores,
           },
+          // execArgv: workerExecArgv, // forward parent's execArgv for tsx support
         });
         startedWorkers.push(worker);
 
