@@ -27,7 +27,6 @@
 import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
 import { availableParallelism } from "os";
 import { statSync } from "fs";
-import { fileURLToPath } from "url";
 import { performance } from "perf_hooks";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -149,6 +148,7 @@ if (!isMainThread) {
       const msg: any = await new Promise((resolve) =>
         parentPort!.once("message", resolve),
       );
+      console.error(`[worker ${workerIndex}] got message, starting inference`);
 
       try {
         const t0 = performance.now();
@@ -156,6 +156,13 @@ if (!isMainThread) {
           { [inputOp]: msg.inputData as Buffer },
           outputOps,
         );
+        console.error(
+          `[worker ${workerIndex}] inference done in ${
+            performance.now() - t0
+          }ms, results keys:`,
+          Object.keys(results ?? {}),
+        );
+
         const inferenceMs = performance.now() - t0;
 
         Atomics.store(ctrl, 0, DONE);
@@ -321,15 +328,15 @@ export class InferencePool {
 
     // Forward the parent's execArgv (e.g. --import tsx) so the worker can
     // load TypeScript files when the test suite runs under tsx directly.
-    const workerExecArgv = process.execArgv;
+    // const workerExecArgv = resolveWorkerExecArgv();
+    const workerEntry = new URL("./inference-pool.ts", import.meta.url);
 
     try {
       for (let i = 0; i < concurrency; i++) {
         const ctrl = new Int32Array(ctrlSab, i * CTRL_SLOTS * 4, CTRL_SLOTS);
         Atomics.store(ctrl, 0, IDLE);
 
-        const worker = new Worker(fileURLToPath(import.meta.url), {
-          execArgv: workerExecArgv,
+        const worker = new Worker(workerEntry, {
           workerData: {
             ctrlSab,
             workerIndex: i,

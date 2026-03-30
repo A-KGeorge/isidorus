@@ -59,7 +59,15 @@ describe("InferencePool Integration", () => {
     const p2 = pool.infer(inputData, [1, 224, 224, 3]);
 
     // Briefly wait for dispatch
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise<void>((resolve) => {
+      const id = setInterval(() => {
+        if (pool.busyCount > 0) {
+          clearInterval(id);
+          resolve();
+        }
+      }, 5);
+    });
+
     assert.strictEqual(pool.busyCount, 1);
     assert.strictEqual(pool.queueDepth, 1);
 

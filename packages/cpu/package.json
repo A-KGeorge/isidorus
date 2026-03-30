@@ -32,10 +32,10 @@
     },
     "binary": {
         "napi_versions": [
-            8   
+            8
         ]
     },
-     "repository": {
+    "repository": {
         "type": "git",
         "url": "git+https://github.com/A-KGeorge/isidorus.git"
     },
@@ -53,10 +53,10 @@
     },
     "devDependencies": {
         "@types/node": "^25.5.0",
-        "tsx": "^4.0.0",
-        "typescript": "^5.4.0",
+        "node-gyp": "^10.0.0",
         "prebuildify": "^6.0.0",
-        "node-gyp": "^10.0.0"
+        "tsx": "^4.0.0",
+        "typescript": "^5.4.0"
     },
     "author": "Alan Kochukalam George",
     "license": "Apache-2.0"
