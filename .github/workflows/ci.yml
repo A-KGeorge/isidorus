@@ -9,6 +9,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   NODE_DEFAULT: "22"
@@ -92,7 +93,13 @@ jobs:
   test-cpu:
     name: "@isidorus/cpu / ${{ matrix.os }} / Node ${{ matrix.node }}"
     needs: [changes, install-libtensorflow]
-    if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
+    if: |
+      github.ref == 'refs/heads/main' || 
+      github.ref == 'refs/heads/develop' || 
+      needs.changes.outputs.cpu == 'true' || 
+      needs.changes.outputs.ci == 'true' || 
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -172,7 +179,13 @@ jobs:
   test-core:
     name: "@isidorus/core / ${{ matrix.os }}"
     needs: [changes]
-    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
+    if: |
+      github.ref == 'refs/heads/main' || 
+      github.ref == 'refs/heads/develop' || 
+      needs.changes.outputs.core == 'true' || 
+      needs.changes.outputs.ci == 'true' || 
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
