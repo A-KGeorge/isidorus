@@ -6,6 +6,8 @@
     "lib": ["ES2022"],
     "outDir": "./dist",
     "rootDir": "./src/ts",
+    "composite": true,
+    "tsBuildInfoFile": "./dist/tsconfig.tsbuildinfo",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
@@ -17,7 +19,7 @@
     },
     "skipLibCheck": true
   },
-  "include": ["src/ts/**/*"],
+  "include": ["src/ts/**/*"], // Update to match rootDir
   "references": [{ "path": "../core" }],
   "exclude": ["node_modules", "dist", "src/ts/**/*.test.ts"]
 }
