@@ -149,15 +149,13 @@ bool affinity_set(AffinityMask mask)
     // This is more effective than affinity tags on M-series chips.
     if (mask != static_cast<AffinityMask>(~0ULL) && mask != 0)
     {
-        ok = pthread_set_qos_class_self_np(
-                 pthread_self(), QOS_CLASS_UTILITY, 0) == 0;
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
     else
     {
         // Restoring full mask — reset to USER_INTERACTIVE so libuv workers
         // can run at full priority for I/O and other native work.
-        pthread_set_qos_class_self_np(
-            pthread_self(), QOS_CLASS_USER_INTERACTIVE, 0);
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
 #endif
 
