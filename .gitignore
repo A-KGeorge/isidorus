@@ -2,3 +2,5 @@ packages/*/node_modules/
 node_modules/
 packages/*/dist/
 packages/*/build/
+dist/
+build/
