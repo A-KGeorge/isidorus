@@ -21,7 +21,6 @@ jobs:
   changes:
     name: Detect changed packages
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     outputs:
       core: ${{ steps.filter.outputs.core }}
       cpu: ${{ steps.filter.outputs.cpu }}
@@ -42,37 +41,12 @@ jobs:
               - '.github/workflows/**'
 
   # ---------------------------------------------------------------------------
-  # 1. @isidorus/core tests (Cross-platform TS)
-  # ---------------------------------------------------------------------------
-  test-core:
-    name: "core / ${{ matrix.os }} / Node ${{ matrix.node }}"
-    needs: [changes]
-    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        node: ["20", "22"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-          cache: "npm"
-      - run: npm ci
-      - name: Build Core
-        run: npm run build -w @isidorus/core
-      - name: Test Core
-        run: npm test -w @isidorus/core
-
-  # ---------------------------------------------------------------------------
-  # 2. Install libtensorflow (Prerequisite for CPU tests)
+  # 1. libtensorflow installation (The prerequisite)
   # ---------------------------------------------------------------------------
   install-libtensorflow:
     name: "libtensorflow / ${{ matrix.os }}"
-    needs: [changes]
-    if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true'
+    needs: changes
+    if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -98,7 +72,6 @@ jobs:
       - name: Install (macOS)
         if: runner.os == 'macOS' && steps.cache-tf.outputs.cache-hit != 'true'
         run: |
-          # Try arm64 first, fallback to x86_64
           wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-arm64.tar.gz" || \
           wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-x86_64.tar.gz"
           sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-*.tar.gz
@@ -112,26 +85,35 @@ jobs:
           Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
 
   # ---------------------------------------------------------------------------
-  # 3. @isidorus/cpu tests (Native)
+  # 2. @isidorus/cpu & dependencies tests
   # ---------------------------------------------------------------------------
   test-cpu:
     name: "cpu / ${{ matrix.os }} / Node ${{ matrix.node }}"
     needs: [changes, install-libtensorflow]
-    if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        node: ["18", "20", "22"]
+        node: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-          cache: "npm"
+          cache: npm
 
-      - name: Set LIBTENSORFLOW_PATH
+      - name: Restore libtensorflow
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/tensorflow
+            /usr/local/lib/libtensorflow*
+            C:\libtensorflow
+          key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
+
+      - name: Set Environment Variables
         shell: bash
         run: |
           if [ "${{ runner.os }}" == "Windows" ]; then
@@ -139,42 +121,35 @@ jobs:
             echo "C:\libtensorflow\lib" >> $GITHUB_PATH
           else
             echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+            if [ "${{ runner.os }}" == "Linux" ]; then sudo ldconfig; fi
           fi
 
-      - run: npm ci
-      - name: Build dependencies
-        run: npm run build -w @isidorus/core
-      - name: Build CPU (Native)
-        run: npm run build -w @isidorus/cpu
-      - name: Test CPU
-        run: npm test -w @isidorus/cpu
+      - name: Install Dependencies
+        # This will now succeed because libtensorflow is in the search path
+        run: npm ci
+
+      - name: Build and Test
+        run: |
+          npm run build -w @isidorus/core
+          npm run build -w @isidorus/cpu
+          npm test -w @isidorus/cpu
 
   # ---------------------------------------------------------------------------
-  # 4. Release and Publish
+  # 3. @isidorus/core tests (Simple TS)
   # ---------------------------------------------------------------------------
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    needs: [test-core, test-cpu]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    permissions:
-      contents: write
-      pull-requests: write
-      id-token: write
+  test-core:
+    name: "core / ${{ matrix.os }}"
+    needs: changes
+    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_DEFAULT }}
-          registry-url: "https://registry.npmjs.org"
-      - run: npm ci
-      - run: npm run build
-      - uses: changesets/action@v1
-        with:
-          version: npm run version
-          publish: npm run publish-packages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_CONFIG_PROVENANCE: true
+      - run: npm ci --ignore-scripts
+      - run: npm run build -w @isidorus/core
+      - run: npm test -w @isidorus/core

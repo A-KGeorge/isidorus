@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: "Package to build"
+        description: "Package to build prebuilds for"
         required: true
         default: "cpu"
         type: choice
@@ -37,32 +37,27 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install libtensorflow (Linux)
-        if: runner.os == 'Linux'
+      - name: Install libtensorflow
+        shell: bash
         run: |
-          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
-          sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
-          sudo ldconfig
-          echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
+            sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+            sudo ldconfig
+            echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-${{ matrix.arch }}.tar.gz"
+            sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-${{ matrix.arch }}.tar.gz
+            echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+          else
+            # Windows
+            pwsh -Command "Invoke-WebRequest -Uri 'https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip' -OutFile libtf.zip"
+            pwsh -Command "Expand-Archive libtf.zip -DestinationPath C:\libtensorflow"
+            echo "LIBTENSORFLOW_PATH=C:\libtensorflow" >> $GITHUB_ENV
+            echo "C:\libtensorflow\lib" >> $GITHUB_PATH
+          fi
 
-      - name: Install libtensorflow (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-${{ matrix.arch }}.tar.gz"
-          sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-${{ matrix.arch }}.tar.gz
-          echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
-
-      - name: Install libtensorflow (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $url = "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip"
-          Invoke-WebRequest -Uri $url -OutFile libtf.zip
-          Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
-          echo "LIBTENSORFLOW_PATH=C:\libtensorflow" >> $env:GITHUB_ENV
-          echo "C:\libtensorflow\lib" >> $env:GITHUB_PATH
-
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run build -w @isidorus/core
       - name: Prebuildify CPU
         run: npm run prebuildify -w @isidorus/cpu
