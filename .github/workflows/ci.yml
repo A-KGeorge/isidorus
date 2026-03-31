@@ -107,6 +107,7 @@ jobs:
           cache: npm
 
       - name: Restore libtensorflow
+        id: cache-tf
         uses: actions/cache@v4
         with:
           path: |
@@ -114,6 +115,32 @@ jobs:
             /usr/local/lib/libtensorflow*
             C:\libtensorflow
           key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
+
+      - name: Install libtensorflow (Linux)
+        if: runner.os == 'Linux' && steps.cache-tf.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
+          sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          sudo ldconfig
+
+      - name: Install libtensorflow (macOS)
+        if: runner.os == 'macOS' && steps.cache-tf.outputs.cache-hit != 'true'
+        run: |
+          if [ "$(uname -m)" = "arm64" ]; then
+            TF_ARCH="arm64"
+          else
+            TF_ARCH="x86_64"
+          fi
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-${TF_ARCH}.tar.gz"
+          sudo tar -C /usr/local -xzf "libtensorflow-cpu-darwin-${TF_ARCH}.tar.gz"
+
+      - name: Install libtensorflow (Windows)
+        if: runner.os == 'Windows' && steps.cache-tf.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile libtf.zip
+          Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
 
       - name: Set LIBTENSORFLOW_PATH
         shell: bash
@@ -176,6 +203,30 @@ jobs:
         with:
           node-version: ${{ env.NODE_DEFAULT }}
           registry-url: "https://registry.npmjs.org"
+
+      - name: Restore libtensorflow
+        id: cache-tf
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/tensorflow
+            /usr/local/lib/libtensorflow*
+          key: libtensorflow-${{ env.TF_VERSION }}-Linux
+
+      - name: Install libtensorflow (Linux)
+        if: steps.cache-tf.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
+          sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          sudo ldconfig
+
+      - name: Set LIBTENSORFLOW_PATH
+        run: |
+          echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
       - run: npm ci --ignore-scripts
       - run: npm run build
       - uses: changesets/action@v1
