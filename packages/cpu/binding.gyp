@@ -46,9 +46,22 @@
         "CLANG_CXX_LIBRARY": "libc++",
         "MACOSX_DEPLOYMENT_TARGET": "10.15",
         "OTHER_CPLUSPLUSFLAGS": [ "-std=c++17", "-stdlib=libc++", "-O3", "-ffast-math"],
-        "GCC_OPTIMIZATION_LEVEL": "3"
+        "GCC_OPTIMIZATION_LEVEL": "3",
+        "LD_RUNPATH_SEARCH_PATHS": [
+          "@loader_path",
+          "/usr/local/lib",
+          "<!@(echo $LIBTENSORFLOW_PATH || echo /usr/local || true)/lib"
+        ]
       },
       "conditions": [
+        # Condition for Linux
+        ["OS=='linux'", {
+          "ldflags": [
+            "-Wl,-rpath,'$$ORIGIN'",
+            "-Wl,-rpath,/usr/local/lib",
+            "-Wl,-rpath,<!@(echo $LIBTENSORFLOW_PATH || echo /usr/local || true)/lib"
+          ]
+        }],
         # Condition for Windows
         ["OS=='win'", {
           "defines": [ "_HAS_EXCEPTIONS=1", "__AVX2__=1", "__AVX__=1", "__SSE3__=1" ],

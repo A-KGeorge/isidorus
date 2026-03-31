@@ -150,7 +150,11 @@ jobs:
             echo "C:\libtensorflow\lib" >> $GITHUB_PATH
           else
             echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
-            if [ "${{ runner.os }}" == "Linux" ]; then sudo ldconfig; fi
+            if [ "${{ runner.os }}" == "Linux" ]; then 
+              sudo ldconfig
+            elif [ "${{ runner.os }}" == "macOS" ]; then
+              echo "DYLD_LIBRARY_PATH=/usr/local/lib:$DYLD_LIBRARY_PATH" >> $GITHUB_ENV
+            fi
           fi
 
       - name: Install build tools (Linux)
