@@ -21,6 +21,7 @@ jobs:
   changes:
     name: Detect changed packages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       core: ${{ steps.filter.outputs.core }}
       cpu: ${{ steps.filter.outputs.cpu }}
@@ -41,7 +42,7 @@ jobs:
               - '.github/workflows/**'
 
   # ---------------------------------------------------------------------------
-  # 1. libtensorflow installation (The prerequisite)
+  # 1. Install libtensorflow (Required for native dependencies)
   # ---------------------------------------------------------------------------
   install-libtensorflow:
     name: "libtensorflow / ${{ matrix.os }}"
@@ -49,6 +50,7 @@ jobs:
     if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
@@ -85,10 +87,10 @@ jobs:
           Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
 
   # ---------------------------------------------------------------------------
-  # 2. @isidorus/cpu & dependencies tests
+  # 2. @isidorus/cpu tests
   # ---------------------------------------------------------------------------
   test-cpu:
-    name: "cpu / ${{ matrix.os }} / Node ${{ matrix.node }}"
+    name: "@isidorus/cpu / ${{ matrix.os }} / Node ${{ matrix.node }}"
     needs: [changes, install-libtensorflow]
     if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
@@ -113,7 +115,7 @@ jobs:
             C:\libtensorflow
           key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
 
-      - name: Set Environment Variables
+      - name: Set LIBTENSORFLOW_PATH
         shell: bash
         run: |
           if [ "${{ runner.os }}" == "Windows" ]; then
@@ -124,22 +126,21 @@ jobs:
             if [ "${{ runner.os }}" == "Linux" ]; then sudo ldconfig; fi
           fi
 
-      - name: Install Dependencies
-        # This will now succeed because libtensorflow is in the search path
-        run: npm ci
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - name: Build and Test
-        run: |
-          npm run build -w @isidorus/core
-          npm run build -w @isidorus/cpu
-          npm test -w @isidorus/cpu
+      - run: npm ci
+      - run: npm run build -w @isidorus/core
+      - run: npm run build -w @isidorus/cpu
+      - run: npm test -w @isidorus/cpu
 
   # ---------------------------------------------------------------------------
-  # 3. @isidorus/core tests (Simple TS)
+  # 3. @isidorus/core tests
   # ---------------------------------------------------------------------------
   test-core:
-    name: "core / ${{ matrix.os }}"
-    needs: changes
+    name: "@isidorus/core / ${{ matrix.os }}"
+    needs: [changes]
     if: needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -150,6 +151,37 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_DEFAULT }}
+          cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run build -w @isidorus/core
       - run: npm test -w @isidorus/core
+
+  # ---------------------------------------------------------------------------
+  # 4. Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [test-core, test-cpu]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_DEFAULT }}
+          registry-url: "https://registry.npmjs.org"
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - uses: changesets/action@v1
+        with:
+          version: npm run version
+          publish: npm run publish-packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
