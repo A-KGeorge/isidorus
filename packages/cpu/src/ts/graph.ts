@@ -106,4 +106,36 @@ export class Graph {
   toGraphDef(): Buffer {
     return this._native.toGraphDef() as Buffer;
   }
+
+  /**
+   * importGraphDef — deserialise a binary GraphDef proto into this graph.
+   *
+   * Used to load a frozen .pb model so it can be executed via the native
+   * Session (which applies ConfigProto thread config and CPU affinity).
+   * The graph must be empty before calling this.
+   *
+   * @param buffer  Raw bytes of a frozen GraphDef proto (.pb file contents)
+   *
+   * @example
+   * import { readFileSync } from "fs";
+   * const g = graph();
+   * g.importGraphDef(readFileSync("model.pb"));
+   * const sess = session(g, { strategy: "tf-parallel", reserveCores: 2 });
+   */
+  importGraphDef(buffer: Buffer): void {
+    this._native.importGraphDef(buffer);
+  }
+
+  // graph.ts
+  getOp(name: string, index = 0): Tensor | null {
+    if (!this._native.hasOp(name)) return null;
+    const tfDtype = this._native.opOutputType(name, index) as number | null;
+    const tfShape = this._native.opOutputShape(name, index) as number[] | null;
+    return makeTensor(
+      name,
+      index,
+      tfDtype != null ? (tfDtype as DType) : null,
+      tfShape != null ? ShapeFromTF(tfShape) : null,
+    );
+  }
 }

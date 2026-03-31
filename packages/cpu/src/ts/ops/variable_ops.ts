@@ -47,7 +47,6 @@ export function variable(
     {
       dtype: { kind: "type", value: dtype },
       shape: { kind: "shape", value: shapeToTF(shape) },
-      shared_name: { kind: "bool", value: false },
       // container and shared_name are string attrs — we use the op name
       // as the variable name which TF uses for checkpoint key resolution.
     },
@@ -95,15 +94,16 @@ export function assignVariable(
   dtype: DType,
   name?: string,
 ): string {
-  const [t] = g.addOp(
+  const opName = name ?? `AssignVariableOp_${handle.opName}`;
+  g.addOp(
     "AssignVariableOp",
     [handle, value],
     {
       dtype: { kind: "type", value: dtype },
     },
-    name,
+    opName,
   );
-  return t.opName;
+  return opName;
 }
 
 /**
@@ -117,15 +117,16 @@ export function assignAdd(
   dtype: DType,
   name?: string,
 ): string {
-  const [t] = g.addOp(
+  const opName = name ?? `AssignAddVariableOp_${handle.opName}`;
+  g.addOp(
     "AssignAddVariableOp",
     [handle, delta],
     {
       dtype: { kind: "type", value: dtype },
     },
-    name,
+    opName,
   );
-  return t.opName;
+  return opName;
 }
 
 /**
@@ -139,15 +140,16 @@ export function assignSub(
   dtype: DType,
   name?: string,
 ): string {
-  const [t] = g.addOp(
+  const opName = name ?? `AssignSubVariableOp_${handle.opName}`;
+  g.addOp(
     "AssignSubVariableOp",
     [handle, delta],
     {
       dtype: { kind: "type", value: dtype },
     },
-    name,
+    opName,
   );
-  return t.opName;
+  return opName;
 }
 
 // ── Initializers ──────────────────────────────────────────────────────────────
@@ -343,16 +345,17 @@ export function applyGradientDescent(
   dtype: DType,
   name?: string,
 ): string {
-  const [t] = g.addOp(
+  const opName = name ?? `ApplyGradientDescent_${handle.opName}`;
+  g.addOp(
     "ResourceApplyGradientDescent",
     [handle, lr, grad],
     {
       T: { kind: "type", value: dtype },
       use_locking: { kind: "bool", value: false },
     },
-    name,
+    opName,
   );
-  return t.opName;
+  return opName;
 }
 
 /**
@@ -376,7 +379,8 @@ export function applyAdam(
   dtype: DType,
   name?: string,
 ): string {
-  const [t] = g.addOp(
+  const opName = name ?? `ApplyAdam_${handle.opName}`;
+  g.addOp(
     "ResourceApplyAdam",
     [
       handle,
@@ -395,9 +399,9 @@ export function applyAdam(
       use_locking: { kind: "bool", value: false },
       use_nesterov: { kind: "bool", value: false },
     },
-    name,
+    opName,
   );
-  return t.opName;
+  return opName;
 }
 
 /**
@@ -416,14 +420,15 @@ export function applyRMSProp(
   dtype: DType,
   name?: string,
 ): string {
-  const [t] = g.addOp(
+  const opName = name ?? `ApplyRMSProp_${handle.opName}`;
+  g.addOp(
     "ResourceApplyRMSProp",
     [handle, msHandle, momHandle, lr, rho, momentum, epsilon, grad],
     {
       T: { kind: "type", value: dtype },
       use_locking: { kind: "bool", value: false },
     },
-    name,
+    opName,
   );
-  return t.opName;
+  return opName;
 }

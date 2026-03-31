@@ -24,6 +24,7 @@ Napi::Object GraphWrap::Init(Napi::Env env, Napi::Object exports)
                                                         InstanceMethod<&GraphWrap::OpOutputShape>("opOutputShape"),
                                                         InstanceMethod<&GraphWrap::ToGraphDef>("toGraphDef"),
                                                         InstanceMethod<&GraphWrap::NumOps>("numOps"),
+                                                        InstanceMethod<&GraphWrap::ImportGraphDef>("importGraphDef"),
                                                     });
     auto *ctor = new Napi::FunctionReference(Napi::Persistent(func));
     env.SetInstanceData<Napi::FunctionReference>(ctor);
@@ -379,4 +380,63 @@ Napi::Value GraphWrap::NumOps(const Napi::CallbackInfo &info)
     while (TF_GraphNextOperation(graph_, &pos))
         ++count;
     return Napi::Number::New(info.Env(), count);
+}
+
+// ---------------------------------------------------------------
+// importGraphDef(buffer: Buffer): void
+//
+// Deserialises a binary GraphDef proto into this graph.
+// Intended use: load a frozen .pb model so the graph can be
+// executed via the native Session (with ConfigProto + affinity).
+//
+// The graph must be empty before calling this — importing into a
+// non-empty graph will produce op name collisions.
+//
+// TF_GraphImportGraphDef uses a prefix option (default "")
+// so all imported op names are used as-is, matching the op
+// names in the original frozen graph.
+// ---------------------------------------------------------------
+Napi::Value GraphWrap::ImportGraphDef(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+
+    if (!graph_)
+    {
+        Napi::Error::New(env, "Graph destroyed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (info.Length() < 1 || !info[0].IsBuffer())
+    {
+        Napi::TypeError::New(env, "importGraphDef(buffer: Buffer)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    auto buf = info[0].As<Napi::Buffer<uint8_t>>();
+
+    // TF_NewBufferFromString copies the bytes into TF-owned memory.
+    // The JS Buffer does not need to outlive this call.
+    TF_Buffer *graphdef =
+        TF_NewBufferFromString(buf.Data(), buf.ByteLength());
+
+    TF_ImportGraphDefOptions *opts = TF_NewImportGraphDefOptions();
+    // Default prefix is "" — op names in the imported graph are
+    // used verbatim, matching the frozen graph's checkpoint keys.
+    TF_ImportGraphDefOptionsSetPrefix(opts, "");
+
+    StatusGuard status;
+    TF_GraphImportGraphDef(graph_, graphdef, opts, status.s);
+
+    TF_DeleteImportGraphDefOptions(opts);
+    TF_DeleteBuffer(graphdef);
+
+    if (!status.ok())
+    {
+        Napi::Error::New(env,
+                         "TF_GraphImportGraphDef failed: " + status.message())
+            .ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
 }

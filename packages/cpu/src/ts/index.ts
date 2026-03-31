@@ -22,6 +22,9 @@ const __dirname = dirname(__filename);
 
 const addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
 
+import { setAddon } from "./_native.js";
+setAddon(addon);
+
 // ── Re-export core types ─────────────────────────────────────────────────────
 export type { Tensor, Shape } from "@isidorus/core";
 export {

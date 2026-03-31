@@ -217,44 +217,134 @@ export function layerNorm(
 }
 
 /**
+ * Build a per-step, per-layer dropout seed tensor for StatelessRandomUniform.
+ *
+ * Seed layout: [global_step_int32, layer_id]
+ *   - global_step changes every forward pass → different mask each step
+ *   - layer_id is a compile-time constant  → different mask per layer
+ *
+ * Usage:
+ *   const stepVar = ops.variable(g, [], DType.INT64, "global_step");
+ *   // ... in training loop:
+ *   const seed = ops.makeDropoutSeed(g, stepVar, 0); // layer 0
+ *   const dropped = ops.dropout(g, x, 0.5, true, seed);
+ *   // after forward pass, increment: ops.assignAdd(g, stepVar, one, DType.INT64)
+ *
+ * @param stepHandle  VarHandleOp tensor for an int64 global step counter.
+ * @param layerId     Compile-time unique integer for this dropout layer.
+ *                    Use 0, 1, 2... for each dropout op in the graph.
+ */
+export function makeDropoutSeed(
+  g: Graph,
+  stepHandle: Tensor,
+  layerId: number,
+): Tensor {
+  // Read the current step value
+  const [stepInt64] = g.addOp("ReadVariableOp", [stepHandle], {
+    dtype: { kind: "type", value: DType.INT64 },
+  });
+
+  // Cast int64 step → int32 (StatelessRandomUniform requires int32 seed)
+  const [stepInt32] = g.addOp("Cast", [stepInt64], {
+    DstT: { kind: "type", value: DType.INT32 },
+  });
+
+  // Layer id as a compile-time int32 scalar constant
+  const layerBuf = Buffer.allocUnsafe(4);
+  layerBuf.writeInt32LE(layerId, 0);
+  const layerT = constant(g, layerBuf, [], DType.INT32);
+
+  // Stack [step, layer_id] → shape [2] int32
+  const [seed] = g.addOp("Pack", [stepInt32, layerT], {
+    axis: { kind: "int", value: 0 },
+  });
+  return seed;
+}
+
+/**
  * Dropout — applies inverted dropout during training.
  *
- * rate: fraction of units to drop (e.g. 0.5 = drop 50%).
- * training: if false, returns x unchanged.
+ * Inverted dropout keeps expected activation magnitude equal to training time:
+ *   kept units are scaled up by 1/(1-rate), dropped units become 0.
+ * This means inference code runs unchanged with no scaling needed.
  *
- * NOTE: TF's Dropout op requires a random seed and noise shape tensor.
- * This implementation wraps the functional form for inference-time use
- * (rate ignored when training=false).
+ * @param rate      Fraction of units to drop, in [0, 1). 0 = no dropout.
+ * @param training  If false, returns x unchanged (identity). Rate is ignored.
  *
- * TODO: wire up training-mode dropout once variable_ops seeds are in place.
+ * ⚠ SEED WARNING:
+ *   The mask is generated with StatelessRandomUniform using a constant seed
+ *   [0, 0]. This means the SAME neurons are dropped on every forward pass.
+ *   For real regularisation, use a counter-based seed (e.g. step variable
+ *   cast to [step, 0]) — wire this up via variable_ops once seeding infrastructure
+ *   is in place. Until then this is only useful for testing graph construction.
  */
 export function dropout(
   g: Graph,
   x: Tensor,
   rate: number,
   training: boolean,
+  seed?: Tensor,
   name?: string,
 ): Tensor {
+  // Validate rate unconditionally — even when training=false, an out-of-range
+  // rate is a caller bug that should surface immediately, not silently pass.
+  if (rate < 0 || rate >= 1) {
+    throw new RangeError(`dropout rate must be in [0, 1), got ${rate}`);
+  }
+
   if (!training || rate === 0) {
-    // Inference: identity pass-through.
+    // Inference path or no dropout: identity pass-through.
     const [t] = g.addOp("Identity", [x], {}, name);
     return t;
   }
 
-  // Training: scale = 1 / (1 - rate), then apply random mask.
-  const keepProb = 1 - rate;
-  const scaleBuf = Buffer.allocUnsafe(4);
-  scaleBuf.writeFloatLE(1 / keepProb, 0);
-  const scaleT = constant(g, scaleBuf, [], DType.FLOAT32);
+  // ── Inverted dropout ────────────────────────────────────────────────────
+  //
+  //   uniform  = StatelessRandomUniform(shape(x), seed=[0,0])  ∈ [0, 1)
+  //   keepMask = uniform >= rate                                 → bool
+  //   masked   = x * cast(keepMask, float32)
+  //   output   = masked * (1 / (1 - rate))                      inverted scale
 
-  const [t] = g.addOp(
-    "Dropout",
-    [x, scaleT],
-    {
-      // noise_shape defaults to shape of x
-    },
-    name,
-  );
+  // shape of x as a runtime int32 tensor (handles dynamic batch dims)
+  const [xShape] = g.addOp("Shape", [x], {
+    out_type: { kind: "type", value: DType.INT32 },
+  });
+
+  // Use provided seed or fall back to constant [0, 0]
+  let seedT: Tensor;
+  if (seed) {
+    seedT = seed;
+  } else {
+    const seedBuf = Buffer.allocUnsafe(8);
+    seedBuf.writeInt32LE(0, 0);
+    seedBuf.writeInt32LE(0, 4);
+    seedT = constant(g, seedBuf, [2], DType.INT32);
+  }
+
+  // Uniform samples in [0, 1).
+  const [uniform] = g.addOp("StatelessRandomUniform", [xShape, seedT], {
+    dtype: { kind: "type", value: DType.FLOAT32 },
+  });
+
+  // keep mask: uniform >= rate → bool
+  const rateBuf = Buffer.allocUnsafe(4);
+  rateBuf.writeFloatLE(rate, 0);
+  const rateT = constant(g, rateBuf, [], DType.FLOAT32);
+  const [keepMaskBool] = g.addOp("GreaterEqual", [uniform, rateT], {});
+
+  // cast bool → float32 (1.0 = keep, 0.0 = drop)
+  const [keepMaskFloat] = g.addOp("Cast", [keepMaskBool], {
+    DstT: { kind: "type", value: DType.FLOAT32 },
+  });
+
+  // apply mask
+  const [masked] = g.addOp("Mul", [x, keepMaskFloat], {});
+
+  // scale by 1 / (1 - rate) — inverted dropout keeps E[output] = E[x]
+  const scaleBuf = Buffer.allocUnsafe(4);
+  scaleBuf.writeFloatLE(1 / (1 - rate), 0);
+  const scaleT = constant(g, scaleBuf, [], DType.FLOAT32);
+  const [t] = g.addOp("Mul", [masked, scaleT], {}, name);
   return t;
 }
 
