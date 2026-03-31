@@ -12,10 +12,6 @@
     "strict": true,
     "esModuleInterop": true,
     "baseUrl": ".",
-    "paths": {
-      "@isidorus/core": ["../core/src/ts/index.ts"],
-      "@isidorus/core/*": ["../core/src/ts/*"]
-    },
     "skipLibCheck": true
   },
   "include": ["src/**/*"],
