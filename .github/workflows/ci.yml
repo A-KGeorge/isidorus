@@ -168,7 +168,7 @@ jobs:
   test-core:
     name: "@isidorus/core / ${{ matrix.os }}"
     needs: [changes]
-    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
