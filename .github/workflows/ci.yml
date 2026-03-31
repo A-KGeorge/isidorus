@@ -222,6 +222,7 @@ jobs:
         run: |
           wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
           sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          rm libtensorflow-cpu-linux-x86_64.tar.gz # Clean up large file
           sudo ldconfig
 
       - name: Set LIBTENSORFLOW_PATH
