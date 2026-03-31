@@ -25,6 +25,7 @@ Napi::Object GraphWrap::Init(Napi::Env env, Napi::Object exports)
                                                         InstanceMethod<&GraphWrap::ToGraphDef>("toGraphDef"),
                                                         InstanceMethod<&GraphWrap::NumOps>("numOps"),
                                                         InstanceMethod<&GraphWrap::ImportGraphDef>("importGraphDef"),
+                                                        InstanceMethod<&GraphWrap::AddGradients>("addGradients"),
                                                     });
     auto *ctor = new Napi::FunctionReference(Napi::Persistent(func));
     env.SetInstanceData<Napi::FunctionReference>(ctor);
@@ -122,6 +123,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             ListType,
             ListInt,
             Tensor,
+            String,
             Unknown
         };
 
@@ -133,7 +135,8 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             {"shape", AttrKind::Shape},
             {"list_type", AttrKind::ListType},
             {"list_int", AttrKind::ListInt},
-            {"tensor", AttrKind::Tensor}};
+            {"tensor", AttrKind::Tensor},
+            {"string", AttrKind::String}};
 
         auto attrs = info[2].As<Napi::Object>();
         auto attrs_keys = attrs.GetPropertyNames();
@@ -222,6 +225,12 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 }
                 break;
             }
+            case AttrKind::String:
+            {
+                std::string s = attr_val.Get("value").As<Napi::String>().Utf8Value();
+                TF_SetAttrString(desc, attr_name.c_str(), s.data(), s.length());
+                break;
+            }
             case AttrKind::Unknown:
             default:
                 Napi::Error::New(env, "Unsupported attr kind: " + kind_str).ThrowAsJavaScriptException();
@@ -250,6 +259,22 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
         {
             for (const auto &input : resolved_inputs)
                 TF_AddInput(desc, input);
+        }
+
+        if (info.Length() >= 5 && info[4].IsArray())
+        {
+            auto ctrl_arr = info[4].As<Napi::Array>();
+            for (uint32_t i = 0; i < ctrl_arr.Length(); i++)
+            {
+                std::string ctrl_name = ctrl_arr.Get(i).As<Napi::String>().Utf8Value();
+                TF_Operation *ctrl_op = TF_GraphOperationByName(graph_, ctrl_name.c_str());
+                if (!ctrl_op)
+                {
+                    Napi::Error::New(env, "Control input op not found: " + ctrl_name).ThrowAsJavaScriptException();
+                    return nullptr;
+                }
+                TF_AddControlInput(desc, ctrl_op);
+            }
         }
 
         if (!apply_attrs(desc))
@@ -439,4 +464,114 @@ Napi::Value GraphWrap::ImportGraphDef(const Napi::CallbackInfo &info)
             .ThrowAsJavaScriptException();
     }
     return env.Undefined();
+}
+
+// ---------------------------------------------------------------------------
+// addGradients — JS signature:
+//   addGradients(
+//     y:   { opName: string; index: number }[],   // loss outputs
+//     x:   { opName: string; index: number }[],   // inputs to diff w.r.t.
+//     dx?: { opName: string; index: number }[],   // initial upstream grads
+//   ) -> { opName: string; index: number }[]      // gradient tensors, len = |x|
+//
+// Wraps TF_AddGradients.  TF injects gradient ops directly into the graph.
+// The returned outputs are the dL/dx_i tensors, one per x_i.
+//
+// dx defaults to ones (i.e. dL/dy = 1 for scalar loss, standard convention).
+// Pass explicit dx when you need to chain gradients or scale the loss.
+//
+// Throws if any op in the path is non-differentiable (e.g. ArgMax).
+// ---------------------------------------------------------------------------
+Napi::Value GraphWrap::AddGradients(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+
+    if (!graph_)
+    {
+        Napi::Error::New(env, "Graph destroyed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (info.Length() < 2 || !info[0].IsArray() || !info[1].IsArray())
+    {
+        Napi::TypeError::New(env, "addGradients(y, x, dx?)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    auto resolve_outputs = [&](Napi::Array arr,
+                               std::vector<TF_Output> &out,
+                               const std::string &label) -> bool
+    {
+        for (uint32_t i = 0; i < arr.Length(); ++i)
+        {
+            auto obj = arr.Get(i).As<Napi::Object>();
+            std::string name = obj.Get("opName").As<Napi::String>().Utf8Value();
+            int idx = obj.Get("index").As<Napi::Number>().Int32Value();
+            TF_Operation *op = TF_GraphOperationByName(graph_, name.c_str());
+            if (!op)
+            {
+                Napi::Error::New(env, label + " op not found: " + name)
+                    .ThrowAsJavaScriptException();
+                return false;
+            }
+            out.push_back({op, idx});
+        }
+        return true;
+    };
+
+    std::vector<TF_Output> y_vec, x_vec, dx_vec;
+
+    if (!resolve_outputs(info[0].As<Napi::Array>(), y_vec, "y"))
+        return env.Undefined();
+    if (!resolve_outputs(info[1].As<Napi::Array>(), x_vec, "x"))
+        return env.Undefined();
+
+    // Optional initial gradients.
+    TF_Output *dx_ptr = nullptr;
+    if (info.Length() >= 3 && info[2].IsArray())
+    {
+        if (!resolve_outputs(info[2].As<Napi::Array>(), dx_vec, "dx"))
+            return env.Undefined();
+        if (dx_vec.size() != y_vec.size())
+        {
+            Napi::Error::New(env,
+                             "addGradients: dx length must equal y length")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        dx_ptr = dx_vec.data();
+    }
+
+    // Allocate output array — TF_AddGradients writes one gradient per x.
+    std::vector<TF_Output> dy(x_vec.size());
+
+    StatusGuard status;
+    TF_AddGradients(
+        graph_,
+        y_vec.data(), static_cast<int>(y_vec.size()),
+        x_vec.data(), static_cast<int>(x_vec.size()),
+        dx_ptr,
+        status.s,
+        dy.data());
+
+    if (!status.ok())
+    {
+        Napi::Error::New(env,
+                         "TF_AddGradients failed: " + status.message())
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // Return array of { opName, index } — same shape as x.
+    Napi::Array result = Napi::Array::New(env, dy.size());
+    for (size_t i = 0; i < dy.size(); ++i)
+    {
+        const char *raw_name = TF_OperationName(dy[i].oper);
+        Napi::Object obj = Napi::Object::New(env);
+        obj.Set("opName", Napi::String::New(env, raw_name ? raw_name : ""));
+        obj.Set("index", Napi::Number::New(env, dy[i].index));
+        result.Set(static_cast<uint32_t>(i), obj);
+    }
+    return result;
 }

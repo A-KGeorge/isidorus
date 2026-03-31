@@ -93,3 +93,4 @@ export type {
   ExecutionStrategy,
 } from "./inference-pool.js";
 export { InferencePool } from "./inference-pool.js";
+export * as optimizers from "./optimizers/index.js";

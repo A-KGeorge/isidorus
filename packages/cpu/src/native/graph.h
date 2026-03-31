@@ -37,16 +37,6 @@ private:
     Napi::Value OpOutputShape(const Napi::CallbackInfo &info);
     Napi::Value ToGraphDef(const Napi::CallbackInfo &info);
     Napi::Value NumOps(const Napi::CallbackInfo &info);
-
-    // ── Frozen graph import ─────────────────────────────────────────────────
-    // importGraphDef(buffer: Buffer): void
-    //
-    // Deserialises a binary GraphDef proto (e.g. a frozen .pb file) into
-    // this graph. The graph must be empty — importing into a non-empty graph
-    // causes op name conflicts.
-    //
-    // Used by InferencePool's tf-parallel path to load frozen models via the
-    // native Session (with ConfigProto thread config + affinity fence) rather
-    // than through jude-tf.
     Napi::Value ImportGraphDef(const Napi::CallbackInfo &info);
+    Napi::Value AddGradients(const Napi::CallbackInfo &info);
 };

@@ -47,6 +47,7 @@ export function variable(
     {
       dtype: { kind: "type", value: dtype },
       shape: { kind: "shape", value: shapeToTF(shape) },
+      shared_name: { kind: "string", value: varName },
       // container and shared_name are string attrs — we use the op name
       // as the variable name which TF uses for checkpoint key resolution.
     },
@@ -309,20 +310,18 @@ export function globalVariablesInitializer(
   initOps: string[],
   name = "init_all_variables",
 ): string {
-  // NoOp with control dependencies on all init ops.
-  // TF runs all control deps before executing the NoOp target.
-  const [t] = g.addOp(
+  // NoOp with control edges to every init AssignVariableOp.
+  // TF_AddControlInput guarantees the NoOp will not execute until all
+  // listed ops have completed, so running this target from a Session
+  // atomically initialises all variables before any training step proceeds.
+  g.addOp(
     "NoOp",
     [],
-    {
-      // Control dependencies are added via the native addOp control_inputs param.
-      // The fourth arg to g.addOp is the op name; control edges are the fifth.
-      // For now, document the pattern — the addOp signature needs control_inputs
-      // support added to graph.cc to wire this up completely.
-    },
+    {},
     name,
+    initOps, // controlInputs — wired via TF_AddControlInput in graph.cc
   );
-  return t.opName;
+  return name;
 }
 
 // ── Optimizer update ops ──────────────────────────────────────────────────────
