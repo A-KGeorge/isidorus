@@ -2,7 +2,8 @@
   "mode": "pre",
   "tag": "alpha",
   "initialVersions": {
-    "@isidorus/core": "0.0.0-alpha.0"
+    "@isidorus/core": "0.0.0-alpha.2",
+    "@isidorus/cpu": "0.0.0-alpha.0"
   },
   "changesets": [
     "rich-eels-kick",
