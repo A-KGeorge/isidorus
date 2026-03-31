@@ -13,8 +13,8 @@
         }
     },
     "scripts": {
-        "build": "tsc",
-        "build:watch": "tsc --watch",
+        "build": "tsc -b",
+        "build:watch": "tsc -b --watch",
         "test": "node scripts/test.js",
         "test:clean": "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
         "test:install": "node scripts/test-install.js"

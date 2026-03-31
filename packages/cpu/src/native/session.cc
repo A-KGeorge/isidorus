@@ -58,6 +58,7 @@ static void make_config_proto(
 
 #ifdef _WIN32
 
+// Windows specific includes/types are in session.h if needed, but we use Windows.h if required.
 AffinityMask affinity_mask_all()
 {
     DWORD_PTR proc_mask = 0, sys_mask = 0;
@@ -98,7 +99,76 @@ bool affinity_set(AffinityMask mask)
                static_cast<DWORD_PTR>(mask)) != 0;
 }
 
-#else // POSIX (Linux, macOS partial)
+#elif defined(__APPLE__)
+
+#include <mach/thread_act.h>
+#include <mach/mach_init.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+
+AffinityMask affinity_mask_all()
+{
+    // macOS does not provide an easy way to get the affinity back as a bitmask
+    // like Linux does, but we know it supports up to 64 cores via affinity tags.
+    // For our purposes, the mask itself on macOS acts more like an ID than a bitmask
+    // when setting `thread_affinity_policy`. 
+    // We return a "full" mask to indicate all cores if we wanted to fallback.
+    return static_cast<AffinityMask>(~0ULL);
+}
+
+AffinityMask affinity_mask_range(int first_core, int num_cores)
+{
+    AffinityMask mask = 0;
+    for (int i = first_core; i < first_core + num_cores; ++i)
+        mask |= (AffinityMask(1) << i);
+    return mask;
+}
+
+AffinityMask affinity_get()
+{
+    // macOS has no native getaffinity that returns a bitmask of allowed cores.
+    // The policy API is set-only for the grouping tag.
+    return static_cast<AffinityMask>(~0ULL);
+}
+
+bool affinity_set(AffinityMask mask)
+{
+    // In macOS, thread_affinity_policy doesn't pin to specific CPU numbers. 
+    // Instead, threads sharing the same arbitrary tag (affinity_tag) are 
+    // hinted to be scheduled on the same L2/L3 cache group.
+    // If the mask is full (all 1s) or 0, we can reset the affinity by using THREAD_AFFINITY_TAG_NULL.
+    
+    thread_affinity_policy_data_t policy;
+    if (mask == static_cast<AffinityMask>(~0ULL) || mask == 0) {
+        policy.affinity_tag = THREAD_AFFINITY_TAG_NULL;
+    } else {
+        // Just use the lowest active bit of the mask as the tag identifier.
+        // It's not a strict core pinning, but groups them. 
+        int tag = 1;
+        for (int i = 0; i < 64; ++i) {
+            if (mask & (AffinityMask(1) << i)) {
+                tag = i + 1;
+                break;
+            }
+        }
+        policy.affinity_tag = tag;
+    }
+    
+    mach_port_t mach_thread = pthread_mach_thread_np(pthread_self());
+    kern_return_t kr = thread_policy_set(
+        mach_thread,
+        THREAD_AFFINITY_POLICY,
+        (thread_policy_t)&policy,
+        THREAD_AFFINITY_POLICY_COUNT
+    );
+    
+    return kr == KERN_SUCCESS;
+}
+
+#else // POSIX (Linux)
+
+#include <sched.h>
+#include <pthread.h>
 
 AffinityMask affinity_mask_all()
 {
