@@ -11,10 +11,7 @@
     "sourceMap": true,
     "strict": true,
     "esModuleInterop": true,
-    "baseUrl": ".",
-    "paths": {
-      "@isidorus/core": ["../core/dist/index.d.ts"]
-    },
+
     "skipLibCheck": true
   },
   "include": ["src/**/*"],
