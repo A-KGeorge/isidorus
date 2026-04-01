@@ -176,7 +176,7 @@ export function batchNorm(
     [x, scale, offset, mean_, variance_],
     {
       epsilon: { kind: "float", value: options.epsilon ?? 1e-3 },
-      data_format: { kind: "string", value: "NHWC" },
+      data_format: { kind: "bool", value: false }, // NHWC
       is_training: { kind: "bool", value: false },
     },
     name,
@@ -275,7 +275,7 @@ export function makeDropoutSeed(
  *   The mask is generated with StatelessRandomUniform using a constant seed
  *   [0, 0]. This means the SAME neurons are dropped on every forward pass.
  *   For real regularisation, use a counter-based seed (e.g. step variable
- *   cast to [step, 0]) — wire this up via variable_ops once seeding infrastructure
+ *   cast to [step, 0]) — wire this up via variable_ops once seeding infra
  *   is in place. Until then this is only useful for testing graph construction.
  */
 export function dropout(
