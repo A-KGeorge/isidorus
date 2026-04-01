@@ -1,7 +1,7 @@
 {
   "targets": [
     {
-      "target_name": "jude-tf",
+      "target_name": "isidorus-cpu",
       "sources": [
         "src/native/addon.cc",
         "src/native/graph.cc",

@@ -1,16 +1,15 @@
-import type { Tensor } from "@isidorus/core";
+import type { Shape, Tensor } from "@isidorus/core";
 import { DType, makeTensor, ShapeFromTF } from "@isidorus/core";
 
-// Attribute value union — mirrors the native AttrValue handling in graph.cc
 export type AttrValue =
   | { kind: "int"; value: number }
   | { kind: "float"; value: number }
   | { kind: "bool"; value: boolean }
+  | { kind: "string"; value: string }
   | { kind: "type"; value: DType }
   | { kind: "shape"; value: number[] } // -1 = unknown dim
   | { kind: "list_type"; value: DType[] }
   | { kind: "list_int"; value: number[] }
-  | { kind: "string"; value: string }
   | { kind: "tensor"; value: InlineTensor };
 
 export interface InlineTensor {
@@ -45,14 +44,14 @@ export class Graph {
   /**
    * Add a raw op to the graph.
    *
-   * @param type      TF op type string, e.g. "MatMul", "Placeholder"
-   * @param inputs    Output references from prior ops
-   * @param attrs     Op attributes
-   * @param name      Optional explicit op name (auto-generated if omitted)
+   * @param type          TF op type string, e.g. "MatMul", "Placeholder"
+   * @param inputs        Data inputs — output references from prior ops
+   * @param attrs         Op attributes
+   * @param name          Optional explicit op name (auto-generated if omitted)
    * @param controlInputs Op names that must complete before this op runs.
    *                      Used by globalVariablesInitializer to sequence init
    *                      ops before the NoOp target that callers wait on.
-   * @returns         Array of output Tensors (one per op output)
+   * @returns             Array of output Tensors (one per op output)
    */
   addOp(
     type: string,
@@ -63,13 +62,11 @@ export class Graph {
   ): Tensor[] {
     const nativeAttrs: Record<string, any> = {};
     for (const [k, v] of Object.entries(attrs)) {
-      if (v.kind === "list_type") {
+      if (v.kind === "list_type")
         nativeAttrs[k] = { kind: "list_type", value: v.value.map(Number) };
-      } else if (v.kind === "type") {
+      else if (v.kind === "type")
         nativeAttrs[k] = { kind: "type", value: Number(v.value) };
-      } else {
-        nativeAttrs[k] = v;
-      }
+      else nativeAttrs[k] = v;
     }
 
     const result = this._native.addOp(
@@ -143,10 +140,7 @@ export class Graph {
     return this._native.numOps() as number;
   }
 
-  /**
-   * Serialise the graph to a binary GraphDef proto.
-   * Useful for saving, inspecting with Netron, or freezing.
-   */
+  /** Serialise the graph to a binary GraphDef proto. */
   toGraphDef(): Buffer {
     return this._native.toGraphDef() as Buffer;
   }
@@ -170,7 +164,22 @@ export class Graph {
     this._native.importGraphDef(buffer);
   }
 
-  // graph.ts
+  /**
+   * listOpsOfType — return the names of all ops whose type matches `type`.
+   * Used to auto-discover Placeholder (input) op names in frozen graphs.
+   */
+  listOpsOfType(type: string): string[] {
+    return this._native.listOpsOfType(type) as string[];
+  }
+
+  /**
+   * listSinkOps — return op names whose outputs are not consumed by any
+   * other op in the graph. These are the natural output ops of a frozen graph.
+   */
+  listSinkOps(): string[] {
+    return this._native.listSinkOps() as string[];
+  }
+
   getOp(name: string, index = 0): Tensor | null {
     if (!this._native.hasOp(name)) return null;
     const tfDtype = this._native.opOutputType(name, index) as number | null;

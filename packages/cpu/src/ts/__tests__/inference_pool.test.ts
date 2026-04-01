@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import "../index.js"; // Initialize native addon
 import { InferencePool } from "../inference-pool.js";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";

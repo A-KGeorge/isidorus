@@ -46,8 +46,7 @@
     },
     "dependencies": {
         "@isidorus/core": "0.0.0-alpha.3",
-        "jude-map": "^0.1.3",
-        "jude-tf": "^0.0.6",
+        "jude-map": "^0.2.3",
         "node-addon-api": "^8.6.0",
         "node-gyp-build": "^4.8.4"
     },

@@ -39,4 +39,6 @@ private:
     Napi::Value NumOps(const Napi::CallbackInfo &info);
     Napi::Value ImportGraphDef(const Napi::CallbackInfo &info);
     Napi::Value AddGradients(const Napi::CallbackInfo &info);
+    Napi::Value ListOpsOfType(const Napi::CallbackInfo &info);
+    Napi::Value ListSinkOps(const Napi::CallbackInfo &info);
 };

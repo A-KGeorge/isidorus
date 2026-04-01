@@ -15,7 +15,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = join(__dirname, "..");
 
-console.log("\nTesting jude-map installation behavior\n");
+console.log("\nTesting Isidorus installation behavior\n");
 console.log(`Platform: ${platform()}`);
 console.log(`Architecture: ${arch()}`);
 

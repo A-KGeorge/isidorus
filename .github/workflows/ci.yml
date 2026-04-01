@@ -15,6 +15,11 @@ env:
   NODE_DEFAULT: "24"
   TF_VERSION: "2.18.1"
 
+# ---------------------------------------------------------------------------
+# Helper: installs libtensorflow and sets LIBTENSORFLOW_PATH + LD path.
+# Shared across multiple jobs via a composite action or inline steps.
+# ---------------------------------------------------------------------------
+
 jobs:
   # ---------------------------------------------------------------------------
   # 0. Detect which packages changed
@@ -43,61 +48,43 @@ jobs:
               - '.github/workflows/**'
 
   # ---------------------------------------------------------------------------
-  # 1. Install libtensorflow (Required for native dependencies)
+  # 1. @isidorus/core tests (pure TypeScript, no native build needed)
   # ---------------------------------------------------------------------------
-  install-libtensorflow:
-    name: "libtensorflow / ${{ matrix.os }}"
+  test-core:
+    name: "@isidorus/core / ${{ matrix.os }}"
     needs: changes
-    if: needs.changes.outputs.cpu == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'pull_request'
+    if: |
+      github.ref == 'refs/heads/main'     ||
+      github.ref == 'refs/heads/develop'  ||
+      needs.changes.outputs.core == 'true' ||
+      needs.changes.outputs.ci   == 'true' ||
+      github.event_name == 'pull_request'  ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - name: Cache libtensorflow
-        id: cache-tf
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          path: |
-            /usr/local/include/tensorflow
-            /usr/local/lib/libtensorflow*
-            C:\libtensorflow
-          key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
-
-      - name: Install (Linux)
-        if: runner.os == 'Linux' && steps.cache-tf.outputs.cache-hit != 'true'
-        run: |
-          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
-          sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
-          sudo ldconfig
-
-      - name: Install (macOS)
-        if: runner.os == 'macOS' && steps.cache-tf.outputs.cache-hit != 'true'
-        run: |
-          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-arm64.tar.gz" || \
-          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-x86_64.tar.gz"
-          sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-*.tar.gz
-
-      - name: Install (Windows)
-        if: runner.os == 'Windows' && steps.cache-tf.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $url = "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip"
-          Invoke-WebRequest -Uri $url -OutFile libtf.zip
-          Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
+          node-version: ${{ env.NODE_DEFAULT }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build -w @isidorus/core
+      - run: npm test  -w @isidorus/core
 
   # ---------------------------------------------------------------------------
-  # 2. @isidorus/cpu tests
+  # 2. @isidorus/cpu tests (requires libtensorflow + native build)
   # ---------------------------------------------------------------------------
   test-cpu:
     name: "@isidorus/cpu / ${{ matrix.os }} / Node ${{ matrix.node }}"
-    needs: [changes, install-libtensorflow]
+    needs: changes
     if: |
-      github.ref == 'refs/heads/main' || 
-      github.ref == 'refs/heads/develop' || 
-      needs.changes.outputs.cpu == 'true' || 
-      needs.changes.outputs.ci == 'true' || 
+      github.ref == 'refs/heads/main'    ||
+      github.ref == 'refs/heads/develop' ||
+      needs.changes.outputs.cpu == 'true' ||
+      needs.changes.outputs.ci  == 'true' ||
       github.event_name == 'pull_request' ||
       github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
@@ -113,100 +100,128 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      - name: Restore libtensorflow
-        id: cache-tf
-        uses: actions/cache@v4
-        with:
-          path: |
-            /usr/local/include/tensorflow
-            /usr/local/lib/libtensorflow*
-            C:\libtensorflow
-          key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
-
-      - name: Install libtensorflow (Linux)
-        if: runner.os == 'Linux' && steps.cache-tf.outputs.cache-hit != 'true'
+      - name: Install libtensorflow + set env (Linux)
+        if: runner.os == 'Linux'
         run: |
           wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
           sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
           sudo ldconfig
+          echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
 
-      - name: Install libtensorflow (macOS)
-        if: runner.os == 'macOS' && steps.cache-tf.outputs.cache-hit != 'true'
+      - name: Install libtensorflow + set env (macOS)
+        if: runner.os == 'macOS'
         run: |
-          if [ "$(uname -m)" = "arm64" ]; then
-            TF_ARCH="arm64"
-          else
-            TF_ARCH="x86_64"
-          fi
-          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-${TF_ARCH}.tar.gz"
-          sudo tar -C /usr/local -xzf "libtensorflow-cpu-darwin-${TF_ARCH}.tar.gz"
+          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/arm64/arm64/')
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-${ARCH}.tar.gz"
+          sudo tar -C /usr/local -xzf "libtensorflow-cpu-darwin-${ARCH}.tar.gz"
+          echo "LIBTENSORFLOW_PATH=/usr/local"   >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=/usr/local/lib" >> $GITHUB_ENV
 
-      - name: Install libtensorflow (Windows)
-        if: runner.os == 'Windows' && steps.cache-tf.outputs.cache-hit != 'true'
+      - name: Install libtensorflow + set env (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $url = "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip"
-          Invoke-WebRequest -Uri $url -OutFile libtf.zip
+          Invoke-WebRequest -Uri "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip" -OutFile libtf.zip
           Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
-
-      - name: Set LIBTENSORFLOW_PATH
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            echo "LIBTENSORFLOW_PATH=C:\libtensorflow" >> $GITHUB_ENV
-            echo "C:\libtensorflow\lib" >> $GITHUB_PATH
-          else
-            echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
-            if [ "${{ runner.os }}" == "Linux" ]; then 
-              sudo ldconfig
-            elif [ "${{ runner.os }}" == "macOS" ]; then
-              echo "DYLD_LIBRARY_PATH=/usr/local/lib:$DYLD_LIBRARY_PATH" >> $GITHUB_ENV
-            fi
-          fi
+          echo "LIBTENSORFLOW_PATH=C:\libtensorflow" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "C:\libtensorflow\lib"                | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run build -w @isidorus/core
       - run: npm run build -w @isidorus/cpu
-      - run: npm test -w @isidorus/cpu
+      - run: npm test  -w @isidorus/cpu
 
   # ---------------------------------------------------------------------------
-  # 3. @isidorus/core tests
+  # 3. Build prebuilds (main-branch pushes only — these are bundled into the
+  #    npm release.  Each runner produces a platform-specific .node file via
+  #    prebuildify, which is then uploaded as a GitHub Actions artifact and
+  #    downloaded by the release job before it calls `changeset publish`.)
+  #
+  # Why here instead of prebuilds.yml:
+  #   Changesets publishes FIRST and creates the git tag after the fact.
+  #   If prebuilds run on the tag they arrive too late — the package is already
+  #   published without them.  Running prebuilds as a dependency of the release
+  #   job in this file guarantees they are present before npm publish runs.
   # ---------------------------------------------------------------------------
-  test-core:
-    name: "@isidorus/core / ${{ matrix.os }}"
-    needs: [changes]
-    if: |
-      github.ref == 'refs/heads/main' || 
-      github.ref == 'refs/heads/develop' || 
-      needs.changes.outputs.core == 'true' || 
-      needs.changes.outputs.ci == 'true' || 
-      github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch'
+  prebuild-cpu:
+    name: "Prebuild @isidorus/cpu / ${{ matrix.os }}"
+    needs: [test-core, test-cpu]
+    # Only run on main pushes that will trigger a release.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            arch: x64
+            tf_url_suffix: linux-x86_64.tar.gz
+            tf_extract: "sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz && sudo ldconfig"
+            tf_env: "LIBTENSORFLOW_PATH=/usr/local"
+          - os: windows-latest
+            arch: x64
+            tf_url_suffix: windows-x86_64.zip
+            tf_extract: 'pwsh -Command "Expand-Archive libtf.zip -DestinationPath C:\libtensorflow"'
+            tf_env: "LIBTENSORFLOW_PATH=C:\\libtensorflow"
+          - os: macos-latest
+            arch: arm64
+            tf_url_suffix: darwin-arm64.tar.gz
+            tf_extract: "sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-arm64.tar.gz"
+            tf_env: "LIBTENSORFLOW_PATH=/usr/local"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_DEFAULT }}
+          node-version: "20" # prebuildify targets Node 18/20/22/24 — build host is 20
           cache: npm
+
+      - name: Install libtensorflow (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          FNAME="libtensorflow-cpu-${{ matrix.tf_url_suffix }}"
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/${FNAME}"
+          ${{ matrix.tf_extract }}
+          echo "${{ matrix.tf_env }}" >> $GITHUB_ENV
+
+      - name: Install libtensorflow (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-${{ matrix.tf_url_suffix }}" -OutFile libtf.zip
+          Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
+          echo "LIBTENSORFLOW_PATH=C:\libtensorflow" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "C:\libtensorflow\lib"                | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
       - run: npm ci --ignore-scripts
       - run: npm run build -w @isidorus/core
-      - run: npm test -w @isidorus/core
+
+      - name: Run prebuildify
+        run: npm run prebuildify -w @isidorus/cpu
+
+      - name: Upload prebuild artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # Unique name per platform so download-artifact can merge them.
+          name: cpu-prebuilds-${{ matrix.os }}-${{ matrix.arch }}
+          path: packages/cpu/prebuilds/
+          retention-days: 7 # only needed until the release job consumes them
 
   # ---------------------------------------------------------------------------
-  # 4. Release
+  # 4. Release — download all prebuilds, then run changesets publish.
+  #    Depends on prebuild-cpu so all .node files exist before npm publish.
   # ---------------------------------------------------------------------------
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [test-core, test-cpu]
+    needs: [test-core, test-cpu, prebuild-cpu]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: write
@@ -216,30 +231,43 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_DEFAULT }}
           registry-url: "https://registry.npmjs.org"
+          cache: npm
 
-      - name: Restore libtensorflow
-        id: cache-tf
-        uses: actions/cache@v4
+      # Download prebuilds from all three platform jobs into the correct path.
+      # actions/download-artifact with merge-multiple:true flattens the three
+      # artifact directories so prebuilds/ ends up as a flat tree:
+      #   packages/cpu/prebuilds/linux-x64/node.napi.node
+      #   packages/cpu/prebuilds/win32-x64/node.napi.node
+      #   packages/cpu/prebuilds/darwin-arm64/node.napi.node
+      - name: Download all prebuild artifacts
+        uses: actions/download-artifact@v4
         with:
-          path: |
-            /usr/local/include/tensorflow
-            /usr/local/lib/libtensorflow*
-          key: libtensorflow-${{ env.TF_VERSION }}-Linux
+          path: packages/cpu/prebuilds/
+          pattern: cpu-prebuilds-*
+          merge-multiple: true
 
+      - name: Verify prebuilds are present
+        run: |
+          echo "Prebuild tree:"
+          find packages/cpu/prebuilds -name "*.node" | sort
+          COUNT=$(find packages/cpu/prebuilds -name "*.node" | wc -l)
+          if [ "$COUNT" -lt 3 ]; then
+            echo "::error::Expected at least 3 prebuilds, found ${COUNT}"
+            exit 1
+          fi
+
+      # libtensorflow is needed for the release build step on Linux.
       - name: Install libtensorflow (Linux)
-        if: steps.cache-tf.outputs.cache-hit != 'true'
         run: |
           wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
           sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
-          rm libtensorflow-cpu-linux-x86_64.tar.gz # Clean up large file
+          rm libtensorflow-cpu-linux-x86_64.tar.gz
           sudo ldconfig
-
-      - name: Set LIBTENSORFLOW_PATH
-        run: |
           echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
 
       - name: Install build tools
@@ -247,6 +275,7 @@ jobs:
 
       - run: npm ci --ignore-scripts
       - run: npm run build
+
       - uses: changesets/action@v1
         with:
           version: npm run version
