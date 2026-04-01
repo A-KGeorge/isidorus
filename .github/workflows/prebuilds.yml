@@ -78,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main # Target the branch you want to commit to
+          ref: develop
 
       - name: Download all prebuilds
         uses: actions/download-artifact@v4
@@ -91,11 +91,13 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage the new .node binaries
           git add packages/cpu/prebuilds/
-          # Only commit if there are actually changes
+
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            echo "No new binaries to commit"
           else
             git commit -m "chore: update prebuilt binaries [skip ci]"
-            git push origin main
+            git push origin develop # Push to the branch, not the tag
           fi
