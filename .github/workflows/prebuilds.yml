@@ -70,3 +70,29 @@ jobs:
           name: cpu-prebuilds-${{ matrix.os }}-${{ matrix.arch }}
           path: packages/cpu/prebuilds/
           retention-days: 30
+  commit-prebuilds:
+    needs: prebuild-cpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v4
+        with:
+          path: packages/cpu/prebuilds/
+          pattern: cpu-prebuilds-*
+          merge-multiple: true
+
+      - name: Commit and Push prebuilds
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/cpu/prebuilds/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update prebuilt binaries [skip ci]"
+            git push
+          fi

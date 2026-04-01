@@ -100,7 +100,7 @@ export function biasAdd(
     "BiasAdd",
     [value, bias],
     {
-      data_format: { kind: "bool", value: false }, // NHWC default
+      data_format: { kind: "string", value: "NHWC" }, // NHWC default
     },
     name,
   );

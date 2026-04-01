@@ -176,7 +176,7 @@ export function batchNorm(
     [x, scale, offset, mean_, variance_],
     {
       epsilon: { kind: "float", value: options.epsilon ?? 1e-3 },
-      data_format: { kind: "bool", value: false }, // NHWC
+      data_format: { kind: "string", value: "NHWC" },
       is_training: { kind: "bool", value: false },
     },
     name,
@@ -371,8 +371,8 @@ export function conv2d(
     [x, filter],
     {
       strides: { kind: "list_int", value: strides },
-      padding: { kind: "bool", value: padding === "SAME" },
-      data_format: { kind: "bool", value: false }, // NHWC
+      padding: { kind: "string", value: padding },
+      data_format: { kind: "string", value: "NHWC" },
     },
     name,
   );
@@ -396,8 +396,8 @@ export function depthwiseConv2d(
     [x, filter],
     {
       strides: { kind: "list_int", value: strides },
-      padding: { kind: "bool", value: padding === "SAME" },
-      data_format: { kind: "bool", value: false }, // NHWC
+      padding: { kind: "string", value: padding },
+      data_format: { kind: "string", value: "NHWC" },
     },
     name,
   );
@@ -421,8 +421,8 @@ export function maxPool(
     {
       ksize: { kind: "list_int", value: ksize },
       strides: { kind: "list_int", value: strides },
-      padding: { kind: "bool", value: padding === "SAME" },
-      data_format: { kind: "bool", value: false },
+      padding: { kind: "string", value: padding },
+      data_format: { kind: "string", value: "NHWC" },
     },
     name,
   );
@@ -444,8 +444,8 @@ export function avgPool(
     {
       ksize: { kind: "list_int", value: ksize },
       strides: { kind: "list_int", value: strides },
-      padding: { kind: "bool", value: padding === "SAME" },
-      data_format: { kind: "bool", value: false },
+      padding: { kind: "string", value: padding },
+      data_format: { kind: "string", value: "NHWC" },
     },
     name,
   );

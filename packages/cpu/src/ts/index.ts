@@ -93,4 +93,14 @@ export type {
   ExecutionStrategy,
 } from "./inference-pool.js";
 export { InferencePool } from "./inference-pool.js";
+
+// ── Model layers and optimizers ───────────────────────────────────────────────
 export * as optimizers from "./optimizers/index.js";
+export type {
+  ActivationFn,
+  Layer,
+  LayerParam,
+  LossFn,
+  TrainStepResult,
+} from "./model/index.js";
+export { Dense, Flatten, Conv2D, Sequential } from "./model/index.js";

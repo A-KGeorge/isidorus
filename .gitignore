@@ -4,3 +4,6 @@ packages/*/dist/
 packages/*/build/
 dist/
 build/
+
+# Explicitly allow prebuilds
+!packages/*/prebuilds/
