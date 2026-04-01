@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.4
+
+### Patch Changes
+
+- 79ca285: Removed jude-tf as dependency
+
 ## 0.0.0-alpha.3
 
 ### Patch Changes
