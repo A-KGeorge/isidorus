@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.5
+
+### Patch Changes
+
+- c280621: fixed bug
+
 ## 0.0.0-alpha.4
 
 ### Patch Changes
