@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.2
+
+### Patch Changes
+
+- ed88517: Trigger prebuild gen
+
 ## 0.0.0-alpha.1
 
 ### Patch Changes
