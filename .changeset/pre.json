@@ -6,6 +6,7 @@
     "@isidorus/cpu": "0.0.0-alpha.0"
   },
   "changesets": [
+    "fresh-wolves-wave",
     "quick-buttons-eat",
     "rich-eels-kick",
     "two-weeks-unite"
