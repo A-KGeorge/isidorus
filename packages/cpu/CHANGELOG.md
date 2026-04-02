@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.6
+
+### Patch Changes
+
+- dfe0498: Fix addon loading
+
 ## 0.0.0-alpha.5
 
 ### Patch Changes
