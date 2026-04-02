@@ -29,6 +29,12 @@ export interface SessionOptions {
    * Default: 2. Set to 0 to let TF choose automatically.
    */
   interOpThreads?: number;
+
+  /**
+   * The NUMA node layout to pin this session's threads to.
+   * Defaults to undefined (disabled) - handled internally by OS scheduling.
+   */
+  numaNode?: number;
 }
 
 /** Raw tensor value passed as a feed. */

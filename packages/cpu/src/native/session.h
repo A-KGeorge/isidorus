@@ -55,6 +55,9 @@ bool affinity_set(AffinityMask mask);
 // e.g. affinity_mask_range(2, 6) = cores 2,3,4,5 (bits 2..5 set)
 AffinityMask affinity_mask_range(int first_core, int num_cores);
 
+// Build a mask covering all cores on a given NUMA node.
+AffinityMask affinity_mask_numa_node(int numa_node);
+
 // Build  a mask covering all online cores.
 AffinityMask affinity_mask_all();
 

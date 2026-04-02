@@ -76,6 +76,14 @@ AffinityMask affinity_mask_range(int first_core, int num_cores)
     return mask;
 }
 
+AffinityMask affinity_mask_numa_node(int numa_node)
+{
+    ULONGLONG mask = 0;
+    if (GetNumaNodeProcessorMask(static_cast<UCHAR>(numa_node), &mask))
+        return static_cast<AffinityMask>(mask);
+    return affinity_mask_all();
+}
+
 AffinityMask affinity_get()
 {
     // Windows has no GetThreadAffinityMask. We set to full and get back
@@ -132,7 +140,11 @@ AffinityMask affinity_mask_range(int first_core, int num_cores)
         mask |= (AffinityMask(1) << i);
     return mask;
 }
-
+AffinityMask affinity_mask_numa_node(int numa_node)
+{
+    // macOS is UMA, return all cores fallback
+    return affinity_mask_all();
+}
 AffinityMask affinity_get()
 {
     // No public API to read core affinity on macOS.
@@ -180,6 +192,8 @@ bool affinity_set(AffinityMask mask)
 
 #include <sched.h>
 #include <pthread.h>
+#include <fstream>
+#include <sstream>
 
 AffinityMask affinity_mask_all()
 {
@@ -203,6 +217,42 @@ AffinityMask affinity_mask_range(int first_core, int num_cores)
     AffinityMask mask = 0;
     for (int i = first_core; i < first_core + num_cores; ++i)
         mask |= (AffinityMask(1) << i);
+    return mask;
+}
+
+AffinityMask affinity_mask_numa_node(int numa_node)
+{
+    AffinityMask mask = 0;
+    std::ostringstream path;
+    path << "/sys/devices/system/node/node" << numa_node << "/cpulist";
+    std::ifstream file(path.str());
+    if (file)
+    {
+        std::string line;
+        if (std::getline(file, line))
+        {
+            std::stringstream ss(line);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                size_t dash = token.find('-');
+                if (dash != std::string::npos)
+                {
+                    int start = std::stoi(token.substr(0, dash));
+                    int end = std::stoi(token.substr(dash + 1));
+                    for (int i = start; i <= end; i++)
+                        mask |= (AffinityMask(1) << i);
+                }
+                else
+                {
+                    int core = std::stoi(token);
+                    mask |= (AffinityMask(1) << core);
+                }
+            }
+        }
+    }
+    if (mask == 0)
+        return affinity_mask_all();
     return mask;
 }
 
@@ -306,6 +356,7 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo &info)
     int intra_op = 1;
     int inter_op = 1;
     int reserve_cores = 0;
+    int numa_node = -1;
 
     if (info.Length() >= 2 && info[1].IsObject())
     {
@@ -334,6 +385,10 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo &info)
             reserve_cores = opts.Get("reserveCores")
                                 .As<Napi::Number>()
                                 .Int32Value();
+        if (opts.Has("numaNode"))
+            numa_node = opts.Get("numaNode")
+                            .As<Napi::Number>()
+                            .Int32Value();
     }
 
     intra_op_threads_ = intra_op;
@@ -342,7 +397,17 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo &info)
     // ── Affinity masks ──────────────────────────────────────────────────────
     full_affinity_mask_ = affinity_mask_all();
 
-    if (reserve_cores > 0)
+    if (numa_node >= 0)
+    {
+        tf_affinity_mask_ = affinity_mask_numa_node(numa_node);
+        fprintf(stderr,
+                "[isidorus] affinity: binding to NUMA node %d, "
+                "TF mask=0x%llx full mask=0x%llx\n",
+                numa_node,
+                static_cast<unsigned long long>(tf_affinity_mask_),
+                static_cast<unsigned long long>(full_affinity_mask_));
+    }
+    else if (reserve_cores > 0)
     {
         int total_cores = static_cast<int>(
             sizeof(AffinityMask) * 8);

@@ -13,52 +13,52 @@
  * clear diagnostic rather than a cryptic "cannot find module" error.
  */
 
-import { existsSync }  from "fs";
+import { existsSync } from "fs";
 import { createWriteStream, mkdirSync } from "fs";
-import { join }        from "path";
+import { join } from "path";
 import { platform, arch } from "os";
-import { get }         from "https";
-import { exec }        from "child_process";
-import { promisify }   from "util";
-import * as readline   from "readline";
+import { get } from "https";
+import { exec } from "child_process";
+import { promisify } from "util";
+import * as readline from "readline";
 
 const execAsync = promisify(exec);
 
 // ─── TF version to download if the user accepts auto-install ────────────────
 const TF_VERSION = "2.18.1";
-const TF_BASE    = `https://storage.googleapis.com/tensorflow/versions/${TF_VERSION}`;
+const TF_BASE = `https://storage.googleapis.com/tensorflow/versions/${TF_VERSION}`;
 
 // ─── Platform-specific config ───────────────────────────────────────────────
 
 interface PlatformConfig {
   /** Library file name to check for. */
-  libFile:       string;
+  libFile: string;
   /** Default search paths, checked in order. */
-  defaultPaths:  string[];
+  defaultPaths: string[];
   /** Download URL for the prebuilt tarball/zip. */
-  downloadUrl:   string;
+  downloadUrl: string;
   /** Default install directory. */
-  installDir:    string;
+  installDir: string;
   /** Shell command to extract the archive (receives archive path). */
-  extractCmd:    (archivePath: string, destDir: string) => string;
+  extractCmd: (archivePath: string, destDir: string) => string;
   /** Environment variable instructions shown on manual install. */
   envInstructions: string;
 }
 
 function getPlatformConfig(): PlatformConfig {
-  const os   = platform();
-  const cpu  = arch();
+  const os = platform();
+  const cpu = arch();
 
   if (os === "win32") {
     return {
-      libFile:      "tensorflow.dll",
+      libFile: "tensorflow.dll",
       defaultPaths: [
         "C:\\libtensorflow\\lib",
         "C:\\Program Files\\libtensorflow\\lib",
       ],
-      downloadUrl:  `${TF_BASE}/libtensorflow-cpu-windows-x86_64.zip`,
-      installDir:   "C:\\libtensorflow",
-      extractCmd:   (archive, dest) =>
+      downloadUrl: `${TF_BASE}/libtensorflow-cpu-windows-x86_64.zip`,
+      installDir: "C:\\libtensorflow",
+      extractCmd: (archive, dest) =>
         `powershell -Command "Expand-Archive -Path '${archive}' -DestinationPath '${dest}' -Force"`,
       envInstructions: [
         `  Set-Item -Path Env:LIBTENSORFLOW_PATH -Value 'C:\\libtensorflow'`,
@@ -72,31 +72,31 @@ function getPlatformConfig(): PlatformConfig {
     const isArm = cpu === "arm64";
     const archStr = isArm ? "arm64" : "x86_64";
     return {
-      libFile:      "libtensorflow.dylib",
+      libFile: "libtensorflow.dylib",
       defaultPaths: [
         "/usr/local/lib",
-        "/opt/homebrew/lib",       // Homebrew ARM
+        "/opt/homebrew/lib", // Homebrew ARM
         "/usr/local/opt/libtensorflow/lib",
       ],
-      downloadUrl:  `${TF_BASE}/libtensorflow-cpu-darwin-${archStr}.tar.gz`,
-      installDir:   "/usr/local",
-      extractCmd:   (archive, dest) => `sudo tar -C '${dest}' -xzf '${archive}'`,
+      downloadUrl: `${TF_BASE}/libtensorflow-cpu-darwin-${archStr}.tar.gz`,
+      installDir: "/usr/local",
+      extractCmd: (archive, dest) => `sudo tar -C '${dest}' -xzf '${archive}'`,
       envInstructions: `  export LIBTENSORFLOW_PATH=/usr/local`,
     };
   }
 
   // Linux (default)
   return {
-    libFile:      "libtensorflow.so",
+    libFile: "libtensorflow.so",
     defaultPaths: [
       "/usr/local/lib",
       "/usr/lib",
       "/usr/lib/x86_64-linux-gnu",
       "/usr/lib/aarch64-linux-gnu",
     ],
-    downloadUrl:  `${TF_BASE}/libtensorflow-cpu-linux-x86_64.tar.gz`,
-    installDir:   "/usr/local",
-    extractCmd:   (archive, dest) =>
+    downloadUrl: `${TF_BASE}/libtensorflow-cpu-linux-x86_64.tar.gz`,
+    installDir: "/usr/local",
+    extractCmd: (archive, dest) =>
       `sudo tar -C '${dest}' -xzf '${archive}' && sudo ldconfig`,
     envInstructions: `  export LIBTENSORFLOW_PATH=/usr/local`,
   };
@@ -131,7 +131,7 @@ export function resolveTfPath(): { tfPath: string; source: string } | null {
     // Env var set but library not there — warn but don't fall through silently.
     process.stderr.write(
       `[isidorus] LIBTENSORFLOW_PATH is set to '${envPath}' but ` +
-      `${config.libFile} was not found there.\n`
+        `${config.libFile} was not found there.\n`,
     );
     return null;
   }
@@ -142,7 +142,7 @@ export function resolveTfPath(): { tfPath: string; source: string } | null {
     if (found) {
       process.stderr.write(
         `[isidorus] Found ${config.libFile} at ${dir} ` +
-        `(set LIBTENSORFLOW_PATH=${dir} to silence this message)\n`
+          `(set LIBTENSORFLOW_PATH=${dir} to silence this message)\n`,
       );
       return { tfPath: dir, source: `default path ${dir}` };
     }
@@ -156,11 +156,12 @@ export function resolveTfPath(): { tfPath: string; source: string } | null {
 async function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const file = createWriteStream(dest);
-    const request = get(url, response => {
+    const request = get(url, (response) => {
       if (response.statusCode === 301 || response.statusCode === 302) {
         // Follow redirect.
         downloadFile(response.headers.location!, dest)
-          .then(resolve).catch(reject);
+          .then(resolve)
+          .catch(reject);
         return;
       }
       if (response.statusCode !== 200) {
@@ -184,7 +185,11 @@ async function downloadFile(url: string, dest: string): Promise<void> {
       });
 
       response.pipe(file);
-      file.on("finish", () => { process.stdout.write("\n"); file.close(); resolve(); });
+      file.on("finish", () => {
+        process.stdout.write("\n");
+        file.close();
+        resolve();
+      });
     });
     request.on("error", reject);
   });
@@ -194,20 +199,23 @@ async function downloadFile(url: string, dest: string): Promise<void> {
 
 async function prompt(question: string): Promise<string> {
   const rl = readline.createInterface({
-    input:  process.stdin,
+    input: process.stdin,
     output: process.stdout,
   });
-  return new Promise(resolve => {
-    rl.question(question, answer => { rl.close(); resolve(answer.trim()); });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
   });
 }
 
 // ─── Auto-install ─────────────────────────────────────────────────────────────
 
 async function autoInstall(config: PlatformConfig): Promise<string | null> {
-  const tmpDir  = process.env["TEMP"] ?? process.env["TMPDIR"] ?? "/tmp";
-  const archiveExt   = config.downloadUrl.endsWith(".zip") ? ".zip" : ".tar.gz";
-  const archivePath  = join(tmpDir, `libtensorflow${archiveExt}`);
+  const tmpDir = process.env["TEMP"] ?? process.env["TMPDIR"] ?? "/tmp";
+  const archiveExt = config.downloadUrl.endsWith(".zip") ? ".zip" : ".tar.gz";
+  const archivePath = join(tmpDir, `libtensorflow${archiveExt}`);
 
   console.log(`\n  Downloading libtensorflow ${TF_VERSION}...`);
   console.log(`  URL: ${config.downloadUrl}`);
@@ -247,6 +255,15 @@ export async function ensureTf(): Promise<string> {
   const resolved = resolveTfPath();
   if (resolved) {
     process.env["LIBTENSORFLOW_PATH"] = resolved.tfPath;
+    if (platform() === "win32") {
+      const isLibAlready =
+        checkDir(resolved.tfPath, "tensorflow.dll") ===
+        join(resolved.tfPath, "tensorflow.dll");
+      const libDir = isLibAlready
+        ? resolved.tfPath
+        : join(resolved.tfPath, "lib");
+      process.env["PATH"] = `${libDir};${process.env["PATH"]}`;
+    }
     return resolved.tfPath;
   }
 
@@ -263,7 +280,7 @@ export async function ensureTf(): Promise<string> {
 
   if (isInteractive) {
     const answer = await prompt(
-      "  Install libtensorflow automatically? [Y/n] "
+      "  Install libtensorflow automatically? [Y/n] ",
     );
     const accepted = answer === "" || answer.toLowerCase() === "y";
 
@@ -273,10 +290,19 @@ export async function ensureTf(): Promise<string> {
         const found = checkDir(installPath, config.libFile);
         if (found) {
           process.env["LIBTENSORFLOW_PATH"] = installPath;
+          if (platform() === "win32") {
+            const isLibAlready =
+              checkDir(installPath, "tensorflow.dll") ===
+              join(installPath, "tensorflow.dll");
+            const libDir = isLibAlready
+              ? installPath
+              : join(installPath, "lib");
+            process.env["PATH"] = `${libDir};${process.env["PATH"]}`;
+          }
           console.log(
             `  libtensorflow installed at ${installPath}.\n` +
-            `  To skip this step in future, set:\n` +
-            `    LIBTENSORFLOW_PATH=${installPath}\n`
+              `  To skip this step in future, set:\n` +
+              `    LIBTENSORFLOW_PATH=${installPath}\n`,
           );
           return installPath;
         }
@@ -292,28 +318,26 @@ export async function ensureTf(): Promise<string> {
   if (os === "win32") {
     console.error(
       `  1. Download:\n` +
-      `     ${config.downloadUrl}\n\n` +
-      `  2. Extract to C:\\libtensorflow\n\n` +
-      `  3. Add to PATH (PowerShell):\n` +
-      `${config.envInstructions}\n\n` +
-      `  4. Add C:\\libtensorflow\\lib to your PATH so tensorflow.dll\n` +
-      `     is found at runtime.\n`
+        `     ${config.downloadUrl}\n\n` +
+        `  2. Extract to C:\\libtensorflow\n\n` +
+        `  3. Add to PATH (PowerShell):\n` +
+        `${config.envInstructions}\n\n` +
+        `  4. Add C:\\libtensorflow\\lib to your PATH so tensorflow.dll\n` +
+        `     is found at runtime.\n`,
     );
   } else {
     console.error(
       `  1. Run:\n` +
-      `     wget ${config.downloadUrl}\n` +
-      `     sudo tar -C /usr/local -xzf $(basename ${config.downloadUrl})\n` +
-      (os === "linux" ? `     sudo ldconfig\n` : ``) +
-      `\n` +
-      `  2. Or set LIBTENSORFLOW_PATH to your install directory:\n` +
-      `${config.envInstructions}\n`
+        `     wget ${config.downloadUrl}\n` +
+        `     sudo tar -C /usr/local -xzf $(basename ${config.downloadUrl})\n` +
+        (os === "linux" ? `     sudo ldconfig\n` : ``) +
+        `\n` +
+        `  2. Or set LIBTENSORFLOW_PATH to your install directory:\n` +
+        `${config.envInstructions}\n`,
     );
   }
 
-  console.error(
-    `  Then re-run your application.\n`
-  );
+  console.error(`  Then re-run your application.\n`);
 
   process.exit(1);
 }

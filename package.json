@@ -13,7 +13,8 @@
         "publish-packages": "changeset publish"
     },
     "devDependencies": {
-        "@changesets/cli" : "^2.27.0",
+        "@changesets/cli": "^2.27.0",
+        "@types/node": "^25.5.0",
         "typescript": "^5.4.0"
     }
 }
