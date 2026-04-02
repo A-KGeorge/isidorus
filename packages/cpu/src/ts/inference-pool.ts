@@ -45,9 +45,6 @@ import { SharedTensorSegment, DType as JudeMapDType } from "jude-map";
 import type { Graph } from "./graph.js";
 import type { Session } from "./session.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const IDLE = 0;
@@ -92,6 +89,8 @@ export interface PoolOptions {
   concurrency?: number;
   /** Input shape for auto probe. Required when model >= 150 MB. */
   probeShape?: number[];
+  /** @internal — populated by create() during auto-discover */
+  _resolvedInputShape?: (number | null)[];
   /** Crossover threshold for auto strategy (ms). Default: 20. */
   autoThresholdMs?: number;
   /**
@@ -170,8 +169,11 @@ if (!isMainThread) {
     // Load the native addon from the package root. Workers inherit
     // LIBTENSORFLOW_PATH and PATH so the addon finds libtensorflow without
     // re-running ensureTf().
-
+    // Same two-candidate resolution as in index.ts: handles both compiled
+    // dist/ (one level up) and tsx source src/ts/ (two levels up).
     let workerAddon: any;
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
     try {
       const addon = nodeGypBuild(join(__dirname, "..")) as any;
       workerAddon = addon.SharedTensor ?? addon;
@@ -330,6 +332,7 @@ export class InferencePool {
   private readonly modelPath: string;
   private readonly inputOp: string;
   private readonly outputOps: string[];
+  private readonly _inputShape: (number | null)[];
 
   private constructor(params: {
     strategy: "worker-pool" | "tf-parallel";
@@ -342,6 +345,7 @@ export class InferencePool {
     modelPath: string;
     inputOp: string;
     outputOps: string[];
+    inputShape: (number | null)[];
   }) {
     this.strategy = params.strategy;
     this.reserveCores = params.reserveCores;
@@ -355,6 +359,16 @@ export class InferencePool {
     this.modelPath = params.modelPath;
     this.inputOp = params.inputOp;
     this.outputOps = params.outputOps;
+    this._inputShape = params.inputShape;
+  }
+
+  /**
+   * Resolved input shape from the model's Placeholder op.
+   * Null dims are dynamic (batch dim is typically null).
+   * Use this to allocate correctly-sized input buffers for infer().
+   */
+  get resolvedInputShape(): (number | null)[] {
+    return this._inputShape;
   }
 
   // ── Factory ────────────────────────────────────────────────────────────────
@@ -382,7 +396,32 @@ export class InferencePool {
           throw new Error(`No sink ops found in ${opts.modelPath}`);
         opts.outputOps = sinks;
       }
+      // Read the input shape from the Placeholder so callers can allocate
+      // correctly-sized buffers without inspecting the model file directly.
+      if (!opts._resolvedInputShape) {
+        const rawShape = g._native.opOutputShape(opts.inputOp, 0) as
+          | number[]
+          | null;
+        opts._resolvedInputShape = rawShape
+          ? rawShape.map((d: number) => (d < 0 ? null : d))
+          : [null];
+      }
       // g is garbage-collected — no explicit destroy needed for a probe graph.
+    }
+    // If opts._resolvedInputShape wasn't set (inputOp was pre-specified),
+    // derive it from the graph now.
+    if (!opts._resolvedInputShape) {
+      const { getAddon } = await import("./_native.js");
+      const { Graph: GCls } = await import("./graph.js");
+      const addon = getAddon();
+      const g = new GCls(new addon.Graph());
+      g.importGraphDef(readFileSync(opts.modelPath));
+      const rawShape = g._native.opOutputShape(opts.inputOp!, 0) as
+        | number[]
+        | null;
+      opts._resolvedInputShape = rawShape
+        ? rawShape.map((d: number) => (d < 0 ? null : d))
+        : [null];
     }
 
     const requestedStrategy = opts.strategy ?? "auto";
@@ -557,6 +596,7 @@ export class InferencePool {
       modelPath: opts.modelPath,
       inputOp: opts.inputOp!,
       outputOps: opts.outputOps!,
+      inputShape: opts._resolvedInputShape ?? [null],
     });
   }
 
@@ -600,6 +640,7 @@ export class InferencePool {
       modelPath: opts.modelPath,
       inputOp: opts.inputOp!,
       outputOps: opts.outputOps!,
+      inputShape: opts._resolvedInputShape ?? [null],
     });
   }
 
