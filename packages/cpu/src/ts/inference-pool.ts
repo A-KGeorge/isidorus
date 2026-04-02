@@ -45,6 +45,9 @@ import { SharedTensorSegment, DType as JudeMapDType } from "jude-map";
 import type { Graph } from "./graph.js";
 import type { Session } from "./session.js";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const IDLE = 0;
@@ -167,8 +170,33 @@ if (!isMainThread) {
     // Load the native addon from the package root. Workers inherit
     // LIBTENSORFLOW_PATH and PATH so the addon finds libtensorflow without
     // re-running ensureTf().
-    const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-    const workerAddon = nodeGypBuild(pkgRoot);
+
+    let workerAddon: any;
+    try {
+      const addon = nodeGypBuild(join(__dirname, "..")) as any;
+      workerAddon = addon.SharedTensor ?? addon;
+    } catch (e) {
+      try {
+        const addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
+        workerAddon = addon.SharedTensor ?? addon;
+      } catch (err: any) {
+        console.error("Failed to load native SharedTensor module.");
+        console.error(
+          "Attempt 1 error (installed path ../):",
+          (e as Error).message,
+        );
+        console.error("Attempt 2 error (local path ../../):", err.message);
+        throw new Error(
+          `Could not load native module. Is the build complete? ` +
+            `Search paths tried: ${join(__dirname, "..")} and ${join(
+              __dirname,
+              "..",
+              "..",
+            )}`,
+        );
+      }
+    }
+
     const nativeGraph = new workerAddon.Graph();
     nativeGraph.importGraphDef(readFileSync(modelPath));
     sess = new workerAddon.Session(nativeGraph, {

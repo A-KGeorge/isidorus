@@ -20,10 +20,34 @@ await ensureTf();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
+let IsidorusAddon: any;
+try {
+  const addon = nodeGypBuild(join(__dirname, "..")) as any;
+  IsidorusAddon = addon.SharedTensor ?? addon;
+} catch (e) {
+  try {
+    const addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
+    IsidorusAddon = addon.SharedTensor ?? addon;
+  } catch (err: any) {
+    console.error("Failed to load native SharedTensor module.");
+    console.error(
+      "Attempt 1 error (installed path ../):",
+      (e as Error).message,
+    );
+    console.error("Attempt 2 error (local path ../../):", err.message);
+    throw new Error(
+      `Could not load native module. Is the build complete? ` +
+        `Search paths tried: ${join(__dirname, "..")} and ${join(
+          __dirname,
+          "..",
+          "..",
+        )}`,
+    );
+  }
+}
 
 import { setAddon } from "./_native.js";
-setAddon(addon);
+setAddon(IsidorusAddon);
 
 // ── Re-export core types ─────────────────────────────────────────────────────
 export type { Tensor, Shape } from "@isidorus/core";
@@ -54,7 +78,7 @@ import { Session } from "./session.js";
  * const x = ops.placeholder(g, "x", [null, 784], DType.FLOAT32);
  */
 export function graph(): Graph {
-  return new Graph(new addon.Graph());
+  return new Graph(new IsidorusAddon.Graph());
 }
 
 /**
@@ -80,7 +104,7 @@ export function session(
     reserveCores?: number;
   },
 ): Session {
-  return new Session(new addon.Session(g._native, options));
+  return new Session(new IsidorusAddon.Session(g._native, options));
 }
 
 // ── Ops namespace ─────────────────────────────────────────────────────────────
