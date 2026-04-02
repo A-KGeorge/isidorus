@@ -109,10 +109,49 @@ export interface PoolResult {
 }
 
 // ─── jude-map DType bridge ───────────────────────────────────────────────────
-// TF_DataType integers used by the native Session match jude-map's DType enum
-// values — both mirror the TensorFlow wire format. We cast directly.
+//
+// @isidorus/core DType mirrors TF wire format (FLOAT32=1, INT64=9, BOOL=10…).
+// jude-map DType is 0-indexed (FLOAT32=0, INT64=3, BOOL=8…).
+// These two enums are NOT offset by a constant — an explicit table is required.
+//
+// TF → jude-map
+const TF_TO_JUDEMAP: Record<number, JudeMapDType> = {
+  1: JudeMapDType.FLOAT32, // TF_FLOAT
+  2: JudeMapDType.FLOAT64, // TF_DOUBLE
+  3: JudeMapDType.INT32, // TF_INT32
+  4: JudeMapDType.UINT8, // TF_UINT8
+  5: JudeMapDType.INT16, // TF_INT16
+  6: JudeMapDType.INT8, // TF_INT8
+  9: JudeMapDType.INT64, // TF_INT64
+  10: JudeMapDType.BOOL, // TF_BOOL
+  17: JudeMapDType.UINT16, // TF_UINT16
+};
+
 function tfDtypeToJudeMap(dtype: number): JudeMapDType {
-  return dtype as unknown as JudeMapDType;
+  const mapped = TF_TO_JUDEMAP[dtype];
+  if (mapped === undefined)
+    throw new Error(`tfDtypeToJudeMap: unsupported TF dtype ${dtype}`);
+  return mapped;
+}
+
+// jude-map → TF (used in worker to reconstruct the TF feed dtype)
+const JUDEMAP_TO_TF: Record<number, number> = {
+  [JudeMapDType.FLOAT32]: 1,
+  [JudeMapDType.FLOAT64]: 2,
+  [JudeMapDType.INT32]: 3,
+  [JudeMapDType.UINT8]: 4,
+  [JudeMapDType.INT16]: 5,
+  [JudeMapDType.INT8]: 6,
+  [JudeMapDType.INT64]: 9,
+  [JudeMapDType.BOOL]: 10,
+  [JudeMapDType.UINT16]: 17,
+};
+
+function judgemapDtypeToTf(dtype: JudeMapDType): number {
+  const mapped = JUDEMAP_TO_TF[dtype as number];
+  if (mapped === undefined)
+    throw new Error(`judgemapDtypeToTf: unsupported jude-map dtype ${dtype}`);
+  return mapped;
 }
 
 // ─── Worker-side logic ──────────────────────────────────────────────────────
@@ -146,11 +185,13 @@ if (!isMainThread) {
     inputOp,
     outputOps,
     reserveCores,
+    totalWorkers,
   } = workerData as {
     ctrlSab: SharedArrayBuffer;
     segSab: SharedArrayBuffer;
     maxInputBytes: number;
     workerIndex: number;
+    totalWorkers: number;
     modelPath: string;
     inputOp: string;
     outputOps: string[];
@@ -171,39 +212,31 @@ if (!isMainThread) {
     // re-running ensureTf().
     // Same two-candidate resolution as in index.ts: handles both compiled
     // dist/ (one level up) and tsx source src/ts/ (two levels up).
-    let workerAddon: any;
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    try {
-      const addon = nodeGypBuild(join(__dirname, "..")) as any;
-      workerAddon = addon.SharedTensor ?? addon;
-    } catch (e) {
-      try {
-        const addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
-        workerAddon = addon.SharedTensor ?? addon;
-      } catch (err: any) {
-        console.error("Failed to load native SharedTensor module.");
-        console.error(
-          "Attempt 1 error (installed path ../):",
-          (e as Error).message,
-        );
-        console.error("Attempt 2 error (local path ../../):", err.message);
-        throw new Error(
-          `Could not load native module. Is the build complete? ` +
-            `Search paths tried: ${join(__dirname, "..")} and ${join(
-              __dirname,
-              "..",
-              "..",
-            )}`,
-        );
-      }
-    }
-
+    const workerDir = dirname(fileURLToPath(import.meta.url));
+    const pkgRoot =
+      [join(workerDir, ".."), join(workerDir, "..", "..")].find((c) => {
+        try {
+          statSync(join(c, "package.json"));
+          return true;
+        } catch {
+          return false;
+        }
+      }) ?? join(workerDir, "..");
+    const workerAddon = nodeGypBuild(pkgRoot);
     const nativeGraph = new workerAddon.Graph();
     nativeGraph.importGraphDef(readFileSync(modelPath));
+    // Divide available CPU threads evenly across all workers so they don't
+    // compete. A single worker gets all threads; 24 workers on a 24-core
+    // machine each get 1 thread. Without this, 24 sessions each defaulting to
+    // all cores causes 576 threads fighting for 24 cores → severe contention.
+    const hwThreads = availableParallelism();
+    const usable = Math.max(1, hwThreads - reserveCores);
+    const intraOpThreads = Math.max(1, Math.floor(usable / totalWorkers));
     sess = new workerAddon.Session(nativeGraph, {
-      strategy: "worker-pool", // intra=1, inter=1
+      strategy: "worker-pool",
       reserveCores,
+      intraOpThreads,
+      interOpThreads: 1,
     });
   } catch (err: any) {
     parentPort!.postMessage({
@@ -246,12 +279,19 @@ if (!isMainThread) {
         if (!tensor)
           throw new Error("seg.read() returned null — segment not written");
 
+        // Convert jude-map dtype back to TF dtype for the native Session feed.
+        // tensor.dtype is jude-map's 0-indexed enum; TF expects its own
+        // non-contiguous wire format values (FLOAT32=1, INT64=9, etc.).
+        const tfDtype = JUDEMAP_TO_TF[tensor.dtype as unknown as number];
+        if (tfDtype === undefined)
+          throw new Error(`Worker: unsupported jude-map dtype ${tensor.dtype}`);
+
         const feeds = [
           {
             opName: inputOp,
             index: 0,
             tensor: {
-              dtype: tensor.dtype as unknown as number,
+              dtype: tfDtype,
               shape: tensor.shape,
               data: Buffer.from(
                 (tensor.data as ArrayBufferView).buffer,
@@ -405,6 +445,12 @@ export class InferencePool {
         opts._resolvedInputShape = rawShape
           ? rawShape.map((d: number) => (d < 0 ? null : d))
           : [null];
+        process.stderr.write(
+          `[isidorus] resolvedInputShape: op="${opts.inputOp}" ` +
+            `rawShape=${JSON.stringify(rawShape)} → ${JSON.stringify(
+              opts._resolvedInputShape,
+            )}\n`,
+        );
       }
       // g is garbage-collected — no explicit destroy needed for a probe graph.
     }
@@ -422,6 +468,12 @@ export class InferencePool {
       opts._resolvedInputShape = rawShape
         ? rawShape.map((d: number) => (d < 0 ? null : d))
         : [null];
+      process.stderr.write(
+        `[isidorus] resolvedInputShape: op="${opts.inputOp}" ` +
+          `rawShape=${JSON.stringify(rawShape)} → ${JSON.stringify(
+            opts._resolvedInputShape,
+          )}\n`,
+      );
     }
 
     const requestedStrategy = opts.strategy ?? "auto";
@@ -550,6 +602,7 @@ export class InferencePool {
             segSab,
             maxInputBytes,
             workerIndex: i,
+            totalWorkers: concurrency,
             modelPath: opts.modelPath,
             inputOp: opts.inputOp,
             outputOps: opts.outputOps,
@@ -716,8 +769,20 @@ export class InferencePool {
         null,
       );
     };
-    slot.worker.once("message", handleMessage);
-    slot.worker.once("error", (err: Error) => this.settleSlot(slot, null, err));
+    // Bind both handlers together so the error listener is removed when the
+    // message fires (and vice versa). Without this, each successful request
+    // permanently accumulates a ".once error" listener on the Worker — after
+    // 10 requests Node.js warns about a possible EventEmitter memory leak.
+    const onError = (err: Error) => {
+      slot.worker.removeListener("message", handleMessage);
+      this.settleSlot(slot, null, err);
+    };
+    const handleMessageAndClean = (msg: any) => {
+      slot.worker.removeListener("error", onError);
+      handleMessage(msg);
+    };
+    slot.worker.once("message", handleMessageAndClean);
+    slot.worker.once("error", onError);
 
     // Zero-copy write — seqlock ensures the Worker sees a consistent snapshot.
     // No postMessage for input data. The Worker reads via seg.read() after
