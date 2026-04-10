@@ -155,8 +155,8 @@ export class Adam {
     );
 
     // stepOp sequences: all param updates, then both beta decays.
-    g.addOp("NoOp", [], {}, "adam/step", [...paramUpdateOps, b1Decay, b2Decay]);
     this.stepOp = "adam/step";
+    g.addOp("NoOp", [], {}, this.stepOp, [...paramUpdateOps, b1Decay, b2Decay]);
   }
 
   async init(sess: Session): Promise<void> {
@@ -169,6 +169,14 @@ export class Adam {
       );
     await sess.run([], [], [this.initOpName]);
     this.initialised = true;
+  }
+
+  /**
+   * targetOps — the op names that constitute one Adam step.
+   * Exposed so trainStep can merge forward + backward into a single runAsync.
+   */
+  get targetOps(): string[] {
+    return [this.stepOp];
   }
 
   /**

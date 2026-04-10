@@ -14,6 +14,11 @@ import {
   sqrt,
   square,
 } from "./math_ops.js";
+import {
+  variableWithInit,
+  readVariable,
+  assignVariable,
+} from "./variable_ops.js";
 
 // ---------------------------------------------------------------------------
 // nn_ops — neural network operations
@@ -176,7 +181,7 @@ export function batchNorm(
     [x, scale, offset, mean_, variance_],
     {
       epsilon: { kind: "float", value: options.epsilon ?? 1e-3 },
-      data_format: { kind: "bool", value: false }, // NHWC
+      data_format: { kind: "string", value: options.dataFormat ?? "NHWC" },
       is_training: { kind: "bool", value: false },
     },
     name,
@@ -217,47 +222,69 @@ export function layerNorm(
 }
 
 /**
- * Build a per-step, per-layer dropout seed tensor for StatelessRandomUniform.
+ * makeDropoutSeed — creates a counter-based int32 [2] seed tensor for dropout.
  *
- * Seed layout: [global_step_int32, layer_id]
- *   - global_step changes every forward pass → different mask each step
- *   - layer_id is a compile-time constant  → different mask per layer
+ * Uses a mutable step variable that increments each forward pass, producing
+ * a unique seed on every call so each training step gets a different mask.
+ * Pass the returned tensor as the `seed` argument to dropout().
  *
- * Usage:
- *   const stepVar = ops.variable(g, [], DType.INT64, "global_step");
- *   // ... in training loop:
- *   const seed = ops.makeDropoutSeed(g, stepVar, 0); // layer 0
- *   const dropped = ops.dropout(g, x, 0.5, true, seed);
- *   // after forward pass, increment: ops.assignAdd(g, stepVar, one, DType.INT64)
+ * @param g        The graph
+ * @param layerId  A unique integer per dropout layer — prevents different
+ *                 dropout layers sharing the same seed sequence.
+ * @param name     Optional op name prefix
  *
- * @param stepHandle  VarHandleOp tensor for an int64 global step counter.
- * @param layerId     Compile-time unique integer for this dropout layer.
- *                    Use 0, 1, 2... for each dropout op in the graph.
+ * @returns  A [2] int32 tensor: [step, layerId]
+ *
+ * @example
+ * const seed = makeDropoutSeed(g, 0, "dropout_seed");
+ * const out  = dropout(g, x, 0.5, true, "dropout", seed);
+ * // Each time the graph runs, the step variable increments → unique mask.
  */
 export function makeDropoutSeed(
   g: Graph,
-  stepHandle: Tensor,
   layerId: number,
+  name?: string,
 ): Tensor {
-  // Read the current step value
-  const [stepInt64] = g.addOp("ReadVariableOp", [stepHandle], {
-    dtype: { kind: "type", value: DType.INT64 },
-  });
+  const pfx = name ?? `dropout_seed_${layerId}`;
 
-  // Cast int64 step → int32 (StatelessRandomUniform requires int32 seed)
-  const [stepInt32] = g.addOp("Cast", [stepInt64], {
-    DstT: { kind: "type", value: DType.INT32 },
-  });
+  // Step variable — int32 scalar, initialised to 0, incremented each step.
+  const stepBuf = Buffer.allocUnsafe(4);
+  stepBuf.writeInt32LE(0, 0);
+  const stepInit = constant(g, stepBuf, [], DType.INT32, `${pfx}/step_init`);
 
-  // Layer id as a compile-time int32 scalar constant
-  const layerBuf = Buffer.allocUnsafe(4);
-  layerBuf.writeInt32LE(layerId, 0);
-  const layerT = constant(g, layerBuf, [], DType.INT32);
+  const { handle: stepHandle, initOp: _initOp } = variableWithInit(
+    g,
+    [],
+    DType.INT32,
+    `${pfx}/step`,
+    stepInit,
+  );
+  const stepRead = readVariable(g, stepHandle, DType.INT32, `${pfx}/step_read`);
 
-  // Stack [step, layer_id] → shape [2] int32
-  const [seed] = g.addOp("Pack", [stepInt32, layerT], {
-    axis: { kind: "int", value: 0 },
-  });
+  // Increment: step + 1
+  const oneBuf = Buffer.allocUnsafe(4);
+  oneBuf.writeInt32LE(1, 0);
+  const oneT = constant(g, oneBuf, [], DType.INT32, `${pfx}/one`);
+  const [newStep] = g.addOp("AddV2", [stepRead, oneT], {}, `${pfx}/increment`);
+
+  // Assign new step back — this runs as a side effect when the graph executes.
+  assignVariable(g, stepHandle, newStep, DType.INT32, `${pfx}/assign`);
+
+  // Pack [step, layerId] into a [2] int32 tensor for StatelessRandomUniform.
+  const layerIdBuf = Buffer.allocUnsafe(4);
+  layerIdBuf.writeInt32LE(layerId, 0);
+  const layerIdT = constant(g, layerIdBuf, [], DType.INT32, `${pfx}/layer_id`);
+
+  const [seed] = g.addOp(
+    "Pack",
+    [stepRead, layerIdT],
+    {
+      N: { kind: "int", value: 2 },
+      axis: { kind: "int", value: 0 },
+    },
+    `${pfx}/seed`,
+  );
+
   return seed;
 }
 
@@ -270,13 +297,10 @@ export function makeDropoutSeed(
  *
  * @param rate      Fraction of units to drop, in [0, 1). 0 = no dropout.
  * @param training  If false, returns x unchanged (identity). Rate is ignored.
- *
- * ⚠ SEED WARNING:
- *   The mask is generated with StatelessRandomUniform using a constant seed
- *   [0, 0]. This means the SAME neurons are dropped on every forward pass.
- *   For real regularisation, use a counter-based seed (e.g. step variable
- *   cast to [step, 0]) — wire this up via variable_ops once seeding infra
- *   is in place. Until then this is only useful for testing graph construction.
+ * @param seed      Optional int32 [2] tensor for the random seed.
+ *                  Use makeDropoutSeed() to create a counter-based seed that
+ *                  produces a different mask on every step.
+ *                  Defaults to constant [0,0] (same mask every step).
  */
 export function dropout(
   g: Graph,
@@ -300,17 +324,16 @@ export function dropout(
 
   // ── Inverted dropout ────────────────────────────────────────────────────
   //
-  //   uniform  = StatelessRandomUniform(shape(x), seed=[0,0])  ∈ [0, 1)
-  //   keepMask = uniform >= rate                                 → bool
+  //   uniform  = StatelessRandomUniform(shape(x), seed)  ∈ [0, 1)
+  //   keepMask = uniform >= rate                           → bool
   //   masked   = x * cast(keepMask, float32)
-  //   output   = masked * (1 / (1 - rate))                      inverted scale
+  //   output   = masked * (1 / (1 - rate))                inverted scale
 
-  // shape of x as a runtime int32 tensor (handles dynamic batch dims)
   const [xShape] = g.addOp("Shape", [x], {
     out_type: { kind: "type", value: DType.INT32 },
   });
 
-  // Use provided seed or fall back to constant [0, 0]
+  // Use provided seed or fall back to constant [0, 0].
   let seedT: Tensor;
   if (seed) {
     seedT = seed;
@@ -321,26 +344,21 @@ export function dropout(
     seedT = constant(g, seedBuf, [2], DType.INT32);
   }
 
-  // Uniform samples in [0, 1).
   const [uniform] = g.addOp("StatelessRandomUniform", [xShape, seedT], {
     dtype: { kind: "type", value: DType.FLOAT32 },
   });
 
-  // keep mask: uniform >= rate → bool
   const rateBuf = Buffer.allocUnsafe(4);
   rateBuf.writeFloatLE(rate, 0);
   const rateT = constant(g, rateBuf, [], DType.FLOAT32);
   const [keepMaskBool] = g.addOp("GreaterEqual", [uniform, rateT], {});
 
-  // cast bool → float32 (1.0 = keep, 0.0 = drop)
   const [keepMaskFloat] = g.addOp("Cast", [keepMaskBool], {
     DstT: { kind: "type", value: DType.FLOAT32 },
   });
 
-  // apply mask
   const [masked] = g.addOp("Mul", [x, keepMaskFloat], {});
 
-  // scale by 1 / (1 - rate) — inverted dropout keeps E[output] = E[x]
   const scaleBuf = Buffer.allocUnsafe(4);
   scaleBuf.writeFloatLE(1 / (1 - rate), 0);
   const scaleT = constant(g, scaleBuf, [], DType.FLOAT32);

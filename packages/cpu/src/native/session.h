@@ -3,6 +3,7 @@
 #include "platform_tf.h"
 #include <string>
 #include <vector>
+#include <mutex>
 #include <cstdint>
 
 // ----------------------------------------------------------------------------
@@ -75,6 +76,13 @@ public:
     // Affinity masks used by RunCtx - set in constructor, read in OnRunWork.
     AffinityMask tf_affinity_mask_ = 0; // 0 = no restriction
     AffinityMask full_affinity_mask_ = 0;
+
+public:
+    // Public for SessionCompletionCallJs (static fn, no friend access).
+    // Not part of the JS-visible API.
+    napi_threadsafe_function completion_tsfn_ = nullptr;
+    std::mutex completion_mu_;
+    std::vector<struct CompletionData *> completion_queue_;
 
 private:
     TF_Graph *graph_ = nullptr;

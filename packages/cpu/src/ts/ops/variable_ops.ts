@@ -47,9 +47,8 @@ export function variable(
     {
       dtype: { kind: "type", value: dtype },
       shape: { kind: "shape", value: shapeToTF(shape) },
-      shared_name: { kind: "string", value: varName },
-      // container and shared_name are string attrs — we use the op name
-      // as the variable name which TF uses for checkpoint key resolution.
+      shared_name: { kind: "string", value: varName }, // unique key for checkpoint resolution
+      container: { kind: "string", value: "" },
     },
     varName,
   );
@@ -95,16 +94,15 @@ export function assignVariable(
   dtype: DType,
   name?: string,
 ): string {
-  const opName = name ?? `AssignVariableOp_${handle.opName}`;
-  g.addOp(
+  const [t] = g.addOp(
     "AssignVariableOp",
     [handle, value],
     {
       dtype: { kind: "type", value: dtype },
     },
-    opName,
+    name,
   );
-  return opName;
+  return t.opName;
 }
 
 /**
@@ -118,16 +116,15 @@ export function assignAdd(
   dtype: DType,
   name?: string,
 ): string {
-  const opName = name ?? `AssignAddVariableOp_${handle.opName}`;
-  g.addOp(
+  const [t] = g.addOp(
     "AssignAddVariableOp",
     [handle, delta],
     {
       dtype: { kind: "type", value: dtype },
     },
-    opName,
+    name,
   );
-  return opName;
+  return t.opName;
 }
 
 /**
@@ -141,16 +138,15 @@ export function assignSub(
   dtype: DType,
   name?: string,
 ): string {
-  const opName = name ?? `AssignSubVariableOp_${handle.opName}`;
-  g.addOp(
+  const [t] = g.addOp(
     "AssignSubVariableOp",
     [handle, delta],
     {
       dtype: { kind: "type", value: dtype },
     },
-    opName,
+    name,
   );
-  return opName;
+  return t.opName;
 }
 
 // ── Initializers ──────────────────────────────────────────────────────────────
@@ -237,16 +233,34 @@ export function truncatedNormalInitializer(
  * For a weight matrix [fan_in, fan_out]:
  *   fan_in  = shape[0]
  *   fan_out = shape[1]
+ * For 2D convolutions [kH, kW, inC, outC]:
+ *   fan_in  = inC * kH * kW
+ *   fan_out = outC * kH * kW
  */
 export function glorotUniformInitializer(
   g: Graph,
-  shape: [number, number], // [fan_in, fan_out]
+  shape: number[],
   dtype: DType = DType.FLOAT32,
   name?: string,
 ): Tensor {
-  const [fanIn, fanOut] = shape;
+  let fanIn = 1;
+  let fanOut = 1;
+
+  if (shape.length === 2) {
+    fanIn = shape[0];
+    fanOut = shape[1];
+  } else if (shape.length >= 3) {
+    // Conv weights: [kH, kW, ..., inC, outC]
+    const receptiveFieldSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+    fanIn = shape[shape.length - 2] * receptiveFieldSize;
+    fanOut = shape[shape.length - 1] * receptiveFieldSize;
+  } else if (shape.length === 1) {
+    fanIn = shape[0];
+    fanOut = shape[0];
+  }
+
   const limit = Math.sqrt(6 / (fanIn + fanOut));
-  const n = fanIn * fanOut;
+  const n = shape.reduce((a, b) => a * b, 1);
   const buf = Buffer.allocUnsafe(n * 4);
   for (let i = 0; i < n; i++) {
     buf.writeFloatLE(Math.random() * 2 * limit - limit, i * 4);
@@ -314,14 +328,14 @@ export function globalVariablesInitializer(
   // TF_AddControlInput guarantees the NoOp will not execute until all
   // listed ops have completed, so running this target from a Session
   // atomically initialises all variables before any training step proceeds.
-  g.addOp(
+  const [t] = g.addOp(
     "NoOp",
     [],
     {},
     name,
     initOps, // controlInputs — wired via TF_AddControlInput in graph.cc
   );
-  return name;
+  return t.opName;
 }
 
 // ── Optimizer update ops ──────────────────────────────────────────────────────
@@ -344,17 +358,16 @@ export function applyGradientDescent(
   dtype: DType,
   name?: string,
 ): string {
-  const opName = name ?? `ApplyGradientDescent_${handle.opName}`;
-  g.addOp(
+  const [t] = g.addOp(
     "ResourceApplyGradientDescent",
     [handle, lr, grad],
     {
       T: { kind: "type", value: dtype },
       use_locking: { kind: "bool", value: false },
     },
-    opName,
+    name,
   );
-  return opName;
+  return t.opName;
 }
 
 /**
@@ -378,8 +391,7 @@ export function applyAdam(
   dtype: DType,
   name?: string,
 ): string {
-  const opName = name ?? `ApplyAdam_${handle.opName}`;
-  g.addOp(
+  const [t] = g.addOp(
     "ResourceApplyAdam",
     [
       handle,
@@ -398,9 +410,9 @@ export function applyAdam(
       use_locking: { kind: "bool", value: false },
       use_nesterov: { kind: "bool", value: false },
     },
-    opName,
+    name,
   );
-  return opName;
+  return t.opName;
 }
 
 /**
@@ -419,15 +431,14 @@ export function applyRMSProp(
   dtype: DType,
   name?: string,
 ): string {
-  const opName = name ?? `ApplyRMSProp_${handle.opName}`;
-  g.addOp(
+  const [t] = g.addOp(
     "ResourceApplyRMSProp",
     [handle, msHandle, momHandle, lr, rho, momentum, epsilon, grad],
     {
       T: { kind: "type", value: dtype },
       use_locking: { kind: "bool", value: false },
     },
-    opName,
+    name,
   );
-  return opName;
+  return t.opName;
 }

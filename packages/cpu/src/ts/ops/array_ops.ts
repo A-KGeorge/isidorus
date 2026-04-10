@@ -90,3 +90,47 @@ export function identity(g: Graph, x: Tensor, name?: string): Tensor {
   const [t] = g.addOp("Identity", [x], {}, name);
   return t;
 }
+
+/**
+ * pad — zero-pad a tensor.
+ *
+ * @param x        Input tensor
+ * @param paddings [[before_dim0, after_dim0], [before_dim1, after_dim1], ...]
+ *                 For NHWC images use [[0,0],[top,bot],[left,right],[0,0]]
+ */
+export function pad(
+  g: Graph,
+  x: Tensor,
+  paddings: [number, number][],
+  name?: string,
+): Tensor {
+  const flat = paddings.flatMap(([a, b]) => [a, b]);
+  const buf = Buffer.allocUnsafe(flat.length * 4);
+  flat.forEach((v, i) => buf.writeInt32LE(v, i * 4));
+  const padsT = constant(g, buf, [paddings.length, 2], DType.INT32);
+  const [t] = g.addOp("Pad", [x, padsT], {}, name);
+  return t;
+}
+
+/**
+ * concat — concatenate tensors along `axis`.
+ */
+export function concat(
+  g: Graph,
+  inputs: Tensor[],
+  axis: number,
+  name?: string,
+): Tensor {
+  const axisBuf = Buffer.allocUnsafe(4);
+  axisBuf.writeInt32LE(axis, 0);
+  const axisT = constant(g, axisBuf, [], DType.INT32);
+  const [t] = g.addOp(
+    "ConcatV2",
+    [...inputs, axisT],
+    {
+      N: { kind: "int", value: inputs.length },
+    },
+    name,
+  );
+  return t;
+}

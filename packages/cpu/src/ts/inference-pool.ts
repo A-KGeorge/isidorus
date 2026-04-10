@@ -1,401 +1,132 @@
 /**
- * InferencePool — strategy-aware inference execution with CPU affinity.
+ * InferencePool — tf-parallel only.
  *
- * Strategies:
- *   worker-pool  N Workers × native Session(intra=1, inter=1)
- *                JS controls parallelism. Each Worker owns one Session.
- *                N concurrent requests run on N cores simultaneously.
- *                Best: small/medium models, high concurrency.
+ * Architecture decision (backed by benchmarks):
  *
- *   tf-parallel  1 native Session × (intra=hw−reserveCores, inter=1)
- *                TF's eigen threadpool owns all TF cores for one request.
- *                Concurrent requests queue behind each other.
- *                Best: large models where one matmul fills all cores.
+ *   Worker-pool was removed. The Atomics-based state machine introduced
+ *   mutex-like coordination that produced p99 spikes under concurrency >= 4.
+ *   TF's internal thread scheduler (intra/interOpThreads) is more efficient
+ *   at CPU parallelism than a Node-level worker pool — it knows which ops can
+ *   run in parallel and avoids false sharing.
  *
- *   auto         Probe-based selection:
- *                  model < 150 MB                 → worker-pool (no probe)
- *                  model ≥ 150 MB + probeShape     → warm probe → threshold
- *                  model ≥ 150 MB, no probeShape   → tf-parallel (fallback)
+ *   tf-parallel: single TF session, async JS queue for concurrent callers.
+ *   TF handles threading internally. Queue limits concurrency via maxQueueDepth.
  *
- * CPU affinity (reserveCores):
- *   Pins TF compute to the LAST (N−reserveCores) cores via OS affinity fence
- *   applied in OnRunWork immediately before/after TF_SessionRun.
- *
- * Transport:
- *   Control plane (state machine) — 4-slot Int32Array over a SharedArrayBuffer.
- *     Main stores WORK, Worker Atomics.wait()s and observes it. Tiny, exact.
- *
- *   Data plane (tensor bytes) — one SharedTensorSegment (jude-map) per slot.
- *     Main calls seg.write(shape, dtype, bytes) — seqlock write, zero copy.
- *     Worker calls seg.read()                  — seqlock read, zero copy.
- *     No postMessage for input data. No SAB size limit concern (control SAB
- *     is 16 bytes per worker; data segments are sized to the model's input).
- *     Atomics are slower than seqlocks — jude-map's seqlock handles the data
- *     plane; Atomics handle only the 4-slot state machine.
+ * Benchmark results (AMD Ryzen 9 5900X, 24 threads):
+ *   bench_small (MobileNetV2, 224x224x3):  1.36-3.5x faster than tfjs-node
+ *   bench_medium (ResNet50, 224x224x3):    1.30-2.35x faster than tfjs-node
+ *   bench_large (Dense ~44M params):       tfjs-node wins on memory-bw workloads
  */
 
-import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
-import { availableParallelism } from "os";
-import { statSync, readFileSync } from "fs";
+import { readFileSync, statSync } from "fs";
 import { performance } from "perf_hooks";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
-import nodeGypBuild from "node-gyp-build";
-import { SharedTensorSegment, DType as JudeMapDType } from "jude-map";
-import type { Graph } from "./graph.js";
-import type { Session } from "./session.js";
+import { availableParallelism } from "os";
 
-// ─── Constants ──────────────────────────────────────────────────────────────
+import { getAddon } from "./_native.js";
+import { Graph } from "./graph.js";
+import { Session } from "./session.js";
+import { debug, warn } from "./_log.js";
+import { DType } from "@isidorus/core";
+import type { TensorValue, FeedValue } from "./session.js";
 
-const IDLE = 0;
-const WORK = 1;
-const DONE = 2;
-const SHUTDOWN = 3;
-const CTRL_SLOTS = 4; // state-machine only — IDLE/WORK/DONE/SHUTDOWN
+// ── Public types ─────────────────────────────────────────────────────────────
 
-const SIZE_THRESHOLD_BYTES = 150 * 1024 * 1024; // 150 MB
-const DEFAULT_AUTO_THRESHOLD = 20; // ms
-
-// Default SharedTensorSegment capacity per Worker slot (bytes).
-// 4 MB covers MobileNetV2 (224×224×3×4 ≈ 602 KB) and ResNet50 single-image
-// inputs with comfortable headroom. Increase via PoolOptions.maxInputBytes
-// for large batch sizes or video frame inputs.
-const DEFAULT_MAX_INPUT_BYTES = 4 * 1024 * 1024;
-
-// ─── Errors ──────────────────────────────────────────────────────────────────
+export type ExecutionStrategy = "tf-parallel";
 
 /**
- * Thrown by infer() when the pending-request queue has reached maxQueueDepth.
- * Callers should treat this as a 503 / backpressure signal and shed load rather
- * than retrying immediately.
+ * Optimisation profile — controls how InferencePool chooses thread counts
+ * and concurrency without exposing raw knobs.
  *
- * @example
- * try {
- *   const result = await pool.infer(buf, shape);
- * } catch (e) {
- *   if (e instanceof QueueFullError) {
- *     res.status(503).json({ error: "inference overloaded, try again later" });
- *   }
- * }
+ *   "auto"       (default) — benchmarks candidate configs during create() and
+ *                picks the one with the best throughput for this model on this
+ *                machine. Adds ~300ms to startup. Recommended for production.
+ *
+ *   "latency"    — minimise per-request latency. Gives all cores to one request
+ *                at a time (intra=usable, maxConcurrent=1). Best for
+ *                interactive workloads and large memory-bandwidth-bound models.
+ *
+ *   "throughput" — maximise requests/second. Splits cores across concurrent
+ *                requests (intra=4, maxConcurrent=floor(usable/4)). Best for
+ *                batch serving of small/medium compute-bound models.
  */
+export type PoolProfile = "auto" | "latency" | "throughput";
+
+export interface PoolOptions {
+  /** Path to a frozen .pb model file. */
+  modelPath: string;
+
+  /**
+   * Optimisation profile. Default: "auto".
+   * @see PoolProfile
+   */
+  profile?: PoolProfile;
+
+  /** Input op name. Auto-discovered from Placeholder ops if not specified. */
+  inputOp?: string;
+
+  /** Output op names. Auto-discovered from sink ops if not specified. */
+  outputOps?: string[];
+
+  /**
+   * Maximum number of requests queued waiting for a slot.
+   * Requests beyond this limit are rejected with QueueFullError.
+   * Default: 128.
+   */
+  maxQueueDepth?: number;
+
+  /**
+   * Advanced: number of CPU cores to reserve for non-TF work.
+   * Default: 0. Ignored when explicit thread counts are set.
+   */
+  reserveCores?: number;
+
+  // ── Expert overrides — skip autotuning when set ───────────────────────────
+  // Only set these if you have profiled the model and know better than auto.
+  // Setting any of these disables the autotuner for that dimension.
+
+  /** Expert: intra-op parallelism (threads per op). */
+  intraOpThreads?: number;
+  /** Expert: inter-op parallelism (concurrent independent graph branches). */
+  interOpThreads?: number;
+  /** Expert: max concurrent runAsync() calls in flight. */
+  maxConcurrent?: number;
+}
+
+export interface PoolResult {
+  outputs: TensorValue[];
+  inferenceMs: number;
+}
+
+/** Thrown when a request arrives but the queue is at maxQueueDepth. */
 export class QueueFullError extends Error {
-  constructor(depth: number, max: number) {
+  constructor(depth: number) {
     super(
-      `InferencePool queue full (depth=${depth}, max=${max}). ` +
-        `Shed load or increase maxQueueDepth.`,
+      `InferencePool queue full (depth=${depth}). ` +
+        `Apply backpressure or increase maxQueueDepth.`,
     );
     this.name = "QueueFullError";
   }
 }
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 
-export type ExecutionStrategy = "worker-pool" | "tf-parallel" | "auto";
+// Autotuner candidate intraOpThreads values.
+// Candidates are filtered to ≤ usable cores and deduped before testing.
+const AUTOTUNE_INTRA_CANDIDATES = [1, 2, 4, 8, 16, 32];
 
-export interface PoolOptions {
-  modelPath: string;
-  /**
-   * Input op name. Optional — if omitted the first Placeholder op in the
-   * frozen graph is used (auto-discover via native graph scan).
-   */
-  inputOp?: string;
-  /**
-   * Output op names. Optional — if omitted the sink ops (ops whose outputs
-   * are not consumed by any other op) are used.
-   */
-  outputOps?: string[];
-  /**
-   * Reserve the first R cores for the event loop and other native libs.
-   * TF inference is pinned to the last (N−R) cores via OS affinity.
-   * Default: 0 (no reservation).
-   */
-  reserveCores?: number;
-  strategy?: ExecutionStrategy;
-  /** Worker thread count (worker-pool). Default: os.availableParallelism(). */
-  concurrency?: number;
-  /** Minimum number of worker threads to maintain (worker-pool). Default: 1. */
-  minWorkers?: number;
-  /** Maximum number of worker threads to spawn under load (worker-pool). Default: concurrency || os.availableParallelism(). */
-  maxWorkers?: number;
-  /** Time in ms a worker can remain idle before being terminated. Default: 5000. */
-  idleTimeoutMs?: number;
-  /** Whether to use NUMA-aware pinning for workers. Default: false. */
-  numaAware?: boolean;
-  /** Input shape for auto probe. Required when model >= 150 MB. */
-  probeShape?: number[];
-  /** @internal — populated by create() during auto-discover */
-  _resolvedInputShape?: (number | null)[];
-  /** Crossover threshold for auto strategy (ms). Default: 20. */
-  autoThresholdMs?: number;
-  /**
-   * Capacity of each Worker's SharedTensorSegment data buffer (bytes).
-   * Must be >= the byte size of the largest input tensor you will feed.
-   * Default: 4 MB.
-   */
-  maxInputBytes?: number;
-  /**
-   * Maximum number of requests that may wait in the queue while all workers
-   * are busy. Once this limit is reached, infer() rejects immediately with
-   * QueueFullError instead of enqueuing.
-   *
-   * A good starting value is 2–4× your concurrency setting — enough headroom
-   * for short bursts without allowing unbounded memory growth under sustained
-   * overload.
-   *
-   * Default: Infinity (no limit, original behaviour).
-   */
-  maxQueueDepth?: number;
-}
+// Iterations per candidate. More = stable but slower startup.
+// 3 warmup + 10 timed ≈ 300–500ms total on typical hardware.
+const AUTOTUNE_WARMUP = 3;
+const AUTOTUNE_ITERS = 10;
 
-export interface PoolResult {
-  workerId: number;
-  strategy: "worker-pool" | "tf-parallel";
-  outputs: { dtype: number; shape: number[]; data: Buffer }[];
-  inferenceMs: number;
-}
+// When two configs are within this fraction of each other in throughput score,
+// prefer the one with higher intraOpThreads (= lower per-request latency).
+// Without this tiebreaker, noise in 10-iter timing can cause the autotuner to
+// pick a high-concurrency/low-intra config that has similar throughput but
+// much worse latency (e.g. 57ms vs 18ms for ResNet50 on a 24-core machine).
+const AUTOTUNE_LATENCY_PREFERENCE_MARGIN = 0.08; // 8%
 
-// ─── jude-map DType bridge ───────────────────────────────────────────────────
-//
-// @isidorus/core DType mirrors TF wire format (FLOAT32=1, INT64=9, BOOL=10…).
-// jude-map DType is 0-indexed (FLOAT32=0, INT64=3, BOOL=8…).
-// These two enums are NOT offset by a constant — an explicit table is required.
-//
-// TF → jude-map
-const TF_TO_JUDEMAP: Record<number, JudeMapDType> = {
-  1: JudeMapDType.FLOAT32, // TF_FLOAT
-  2: JudeMapDType.FLOAT64, // TF_DOUBLE
-  3: JudeMapDType.INT32, // TF_INT32
-  4: JudeMapDType.UINT8, // TF_UINT8
-  5: JudeMapDType.INT16, // TF_INT16
-  6: JudeMapDType.INT8, // TF_INT8
-  9: JudeMapDType.INT64, // TF_INT64
-  10: JudeMapDType.BOOL, // TF_BOOL
-  17: JudeMapDType.UINT16, // TF_UINT16
-};
-
-function tfDtypeToJudeMap(dtype: number): JudeMapDType {
-  const mapped = TF_TO_JUDEMAP[dtype];
-  if (mapped === undefined)
-    throw new Error(`tfDtypeToJudeMap: unsupported TF dtype ${dtype}`);
-  return mapped;
-}
-
-// jude-map → TF (used in worker to reconstruct the TF feed dtype)
-const JUDEMAP_TO_TF: Record<number, number> = {
-  [JudeMapDType.FLOAT32]: 1,
-  [JudeMapDType.FLOAT64]: 2,
-  [JudeMapDType.INT32]: 3,
-  [JudeMapDType.UINT8]: 4,
-  [JudeMapDType.INT16]: 5,
-  [JudeMapDType.INT8]: 6,
-  [JudeMapDType.INT64]: 9,
-  [JudeMapDType.BOOL]: 10,
-  [JudeMapDType.UINT16]: 17,
-};
-
-function judgemapDtypeToTf(dtype: JudeMapDType): number {
-  const mapped = JUDEMAP_TO_TF[dtype as number];
-  if (mapped === undefined)
-    throw new Error(`judgemapDtypeToTf: unsupported jude-map dtype ${dtype}`);
-  return mapped;
-}
-
-// ─── Worker-side logic ──────────────────────────────────────────────────────
-//
-// Runs when this file is loaded by inference-pool-worker.mjs (tsx bootstrap)
-// or by the compiled .js entry as a Worker thread.
-//
-// Transport:
-//   Control plane  — Int32Array over ctrlSab (4 slots, state machine only)
-//   Data plane     — SharedTensorSegment reconstructed from segSab (jude-map)
-//
-// Init:
-//   Loads the native addon directly (no import from @isidorus/cpu — that would
-//   re-run ensureTf() and create a circular module reference).
-//   Loads the frozen graph via importGraphDef(readFileSync(modelPath)).
-//
-// Work loop:
-//   Atomics.wait(ctrl, 0, IDLE)         ← park
-//   const { data, shape, dtype } = seg.read()  ← seqlock read, zero copy
-//   results = await sess.runAsync(feeds, fetches)        ← sync on Worker thread, no UV pool
-//   Atomics.store(ctrl, 0, DONE) + notify
-//   postMessage({ type: "result", ... })
-
-if (!isMainThread) {
-  const {
-    ctrlSab,
-    segSab,
-    maxInputBytes,
-    workerIndex,
-    modelPath,
-    inputOp,
-    outputOps,
-    reserveCores,
-    totalWorkers,
-    numaNode,
-  } = workerData as {
-    ctrlSab: SharedArrayBuffer;
-    segSab: SharedArrayBuffer;
-    maxInputBytes: number;
-    workerIndex: number;
-    totalWorkers: number;
-    modelPath: string;
-    inputOp: string;
-    outputOps: string[];
-    reserveCores: number;
-    numaNode: number;
-  };
-
-  const ctrl = new Int32Array(
-    ctrlSab,
-    workerIndex * CTRL_SLOTS * 4,
-    CTRL_SLOTS,
-  );
-
-  // ── Init ─────────────────────────────────────────────────────────────────
-  let sess: any;
-  try {
-    // Load the native addon from the package root. Workers inherit
-    // LIBTENSORFLOW_PATH and PATH so the addon finds libtensorflow without
-    // re-running ensureTf().
-    // Same two-candidate resolution as in index.ts: handles both compiled
-    // dist/ (one level up) and tsx source src/ts/ (two levels up).
-    const workerDir = dirname(fileURLToPath(import.meta.url));
-    const pkgRoot =
-      [join(workerDir, ".."), join(workerDir, "..", "..")].find((c) => {
-        try {
-          statSync(join(c, "package.json"));
-          return true;
-        } catch {
-          return false;
-        }
-      }) ?? join(workerDir, "..");
-    const workerAddon = nodeGypBuild(pkgRoot);
-    const nativeGraph = new workerAddon.Graph();
-    nativeGraph.importGraphDef(readFileSync(modelPath));
-    // Divide available CPU threads evenly across all workers so they don't
-    // compete. A single worker gets all threads; 24 workers on a 24-core
-    // machine each get 1 thread. Without this, 24 sessions each defaulting to
-    // all cores causes 576 threads fighting for 24 cores → severe contention.
-    const hwThreads = availableParallelism();
-    const usable = Math.max(1, hwThreads - reserveCores);
-    const intraOpThreads = 1;
-    sess = new workerAddon.Session(nativeGraph, {
-      strategy: "worker-pool",
-      reserveCores,
-      numaNode,
-      intraOpThreads,
-      interOpThreads: 1,
-    });
-  } catch (err: any) {
-    parentPort!.postMessage({
-      type: "init_error",
-      error: err?.stack ?? String(err),
-    });
-    process.exit(1);
-  }
-
-  // Reconstruct the SharedTensorSegment from the SAB passed via workerData.
-  // jude-map segments are SAB-backed — the same underlying memory is accessible
-  // from both the main thread and this Worker.
-  const seg = SharedTensorSegment.fromSharedBuffer(segSab, maxInputBytes);
-
-  Atomics.store(ctrl, 0, IDLE);
-  parentPort!.postMessage({ type: "ready" });
-
-  // ── Work loop ─────────────────────────────────────────────────────────────
-  // Atomics.wait BLOCKS — intentional. This Worker is dedicated to inference
-  // and has no other async work to process while parked.
-  while (true) {
-    Atomics.wait(ctrl, 0, IDLE);
-    const state = Atomics.load(ctrl, 0);
-
-    if (state === SHUTDOWN) {
-      sess.destroy();
-      seg.destroy();
-      parentPort!.postMessage({ type: "shutdown_ack" });
-      break;
-    }
-
-    if (state === WORK) {
-      try {
-        const t0 = performance.now();
-
-        // Zero-copy read — seqlock guarantees a consistent snapshot.
-        // Main thread called seg.write() before storing WORK, so the data
-        // is fully committed before we observe WORK here.
-        const tensor = seg.read();
-        if (!tensor)
-          throw new Error("seg.read() returned null — segment not written");
-
-        // Convert jude-map dtype back to TF dtype for the native Session feed.
-        // tensor.dtype is jude-map's 0-indexed enum; TF expects its own
-        // non-contiguous wire format values (FLOAT32=1, INT64=9, etc.).
-        const tfDtype = JUDEMAP_TO_TF[tensor.dtype as unknown as number];
-        if (tfDtype === undefined)
-          throw new Error(`Worker: unsupported jude-map dtype ${tensor.dtype}`);
-
-        const feeds = [
-          {
-            opName: inputOp,
-            index: 0,
-            tensor: {
-              dtype: tfDtype,
-              shape: tensor.shape,
-              data: Buffer.from(
-                (tensor.data as ArrayBufferView).buffer,
-                (tensor.data as ArrayBufferView).byteOffset,
-                (tensor.data as ArrayBufferView).byteLength,
-              ),
-            },
-          },
-        ];
-        const fetches = outputOps.map((op: string) => ({
-          opName: op,
-          index: 0,
-        }));
-
-        const rawOutputs = (await sess.runAsync(feeds, fetches)) as Array<{
-          dtype: number;
-          shape: number[];
-          data: Buffer;
-        }>;
-        const inferenceMs = performance.now() - t0;
-
-        // Signal done before postMessage so main thread can unblock.
-        Atomics.store(ctrl, 0, DONE);
-        Atomics.notify(ctrl, 0, 1);
-
-        parentPort!.postMessage({
-          type: "result",
-          outputs: outputOps.map((_: string, i: number) => rawOutputs[i]),
-          inferenceMs,
-        });
-      } catch (err: any) {
-        Atomics.store(ctrl, 0, DONE);
-        Atomics.notify(ctrl, 0, 1);
-        parentPort!.postMessage({
-          type: "work_error",
-          error: err?.stack ?? String(err),
-        });
-      }
-
-      // compareExchange: if main wrote SHUTDOWN between DONE and here, keep it.
-      Atomics.compareExchange(ctrl, 0, DONE, IDLE);
-    }
-  }
-}
-
-// ─── Main-thread InferencePool ──────────────────────────────────────────────
-
-interface WorkerSlot {
-  worker: Worker;
-  ctrl: Int32Array; // 4-slot state machine
-  seg: SharedTensorSegment; // jude-map data transport
-  busy: boolean;
-  resolve: ((r: PoolResult) => void) | null;
-  reject: ((e: Error) => void) | null;
-}
+// ── Internal ──────────────────────────────────────────────────────────────────
 
 interface QueueEntry {
   inputBuf: Buffer;
@@ -405,592 +136,471 @@ interface QueueEntry {
   reject: (e: Error) => void;
 }
 
-export class InferencePool {
-  readonly strategy: "worker-pool" | "tf-parallel";
-  readonly reserveCores: number;
+// ── InferencePool ─────────────────────────────────────────────────────────────
 
-  private readonly workerSlots: WorkerSlot[];
-  private readonly queue: QueueEntry[];
-  private readonly maxQueueDepth: number;
-  private readonly ctrlSab: SharedArrayBuffer | null;
-  private tfParallelGraph: Graph | null;
-  private tfParallelSess: Session | null;
-  private tfParallelBusy: boolean;
-  private readonly tfParallelQueue: QueueEntry[];
-  private readonly modelPath: string;
+export class InferencePool {
+  readonly strategy: ExecutionStrategy = "tf-parallel";
+
+  private readonly graph: Graph;
+  private readonly sess: Session;
   private readonly inputOp: string;
   private readonly outputOps: string[];
+  private readonly maxQueueDepth: number;
   private readonly _inputShape: (number | null)[];
+  private readonly modelPath: string;
+
+  private active = 0;
+  private destroyed = false;
+  private readonly queue: QueueEntry[] = [];
+  private readonly maxConcurrent: number;
 
   private constructor(params: {
-    strategy: "worker-pool" | "tf-parallel";
-    reserveCores: number;
-    workerSlots: WorkerSlot[];
-    queue: QueueEntry[];
-    maxQueueDepth: number;
-    ctrlSab: SharedArrayBuffer | null;
-    tfParallelGraph: Graph | null;
-    tfParallelSess: Session | null;
-    modelPath: string;
+    graph: Graph;
+    sess: Session;
     inputOp: string;
     outputOps: string[];
+    maxQueueDepth: number;
+    maxConcurrent: number;
     inputShape: (number | null)[];
+    modelPath: string;
   }) {
-    this.strategy = params.strategy;
-    this.reserveCores = params.reserveCores;
-    this.workerSlots = params.workerSlots;
-    this.queue = params.queue;
-    this.maxQueueDepth = params.maxQueueDepth;
-    this.ctrlSab = params.ctrlSab;
-    this.tfParallelGraph = params.tfParallelGraph;
-    this.tfParallelSess = params.tfParallelSess;
-    this.tfParallelBusy = false;
-    this.tfParallelQueue = [];
-    this.modelPath = params.modelPath;
+    this.graph = params.graph;
+    this.sess = params.sess;
     this.inputOp = params.inputOp;
     this.outputOps = params.outputOps;
+    this.maxQueueDepth = params.maxQueueDepth;
+    this.maxConcurrent = params.maxConcurrent;
     this._inputShape = params.inputShape;
+    this.modelPath = params.modelPath;
   }
 
+  // ── Factory ───────────────────────────────────────────────────────────────
+
+  static async create(opts: PoolOptions): Promise<InferencePool> {
+    const addon = getAddon();
+    const g = new Graph(new addon.Graph());
+    g.importGraphDef(readFileSync(opts.modelPath));
+
+    // Auto-discover inputOp and outputOps.
+    let inputOp = opts.inputOp;
+    let outputOps = opts.outputOps?.slice();
+
+    if (!inputOp || !outputOps?.length) {
+      if (!inputOp) {
+        const placeholders = g.listOpsOfType("Placeholder");
+        if (!placeholders.length)
+          throw new Error(`No Placeholder ops found in ${opts.modelPath}`);
+        inputOp = placeholders[0];
+      }
+      if (!outputOps?.length) {
+        const sinks = g.listSinkOps();
+        if (!sinks.length)
+          throw new Error(`No sink ops found in ${opts.modelPath}`);
+        outputOps = sinks;
+      }
+    }
+
+    // Resolve input shape from the graph's Placeholder type info.
+    const rawShape = g._native.opOutputShape(inputOp, 0) as number[] | null;
+    const inputShape = rawShape
+      ? rawShape.map((d: number) => (d < 0 ? null : d))
+      : [null];
+    debug(
+      `resolvedInputShape: op="${inputOp}" rawShape=${JSON.stringify(
+        rawShape,
+      )} -> ${JSON.stringify(inputShape)}`,
+    );
+
+    const hw = availableParallelism();
+    const reserveCores = opts.reserveCores ?? 0;
+    const usable = Math.max(1, hw - reserveCores);
+    const profile = opts.profile ?? "auto";
+
+    // ── libuv thread pool check ───────────────────────────────────────────────
+    // Each runAsync() call occupies one libuv worker thread for the full
+    // duration of TF_SessionRun. Node's default UV_THREADPOOL_SIZE is 4 —
+    // meaning maxConcurrent > 4 has no effect without raising it first.
+    // UV_THREADPOOL_SIZE must be set BEFORE Node starts (in the environment
+    // or via a loader), not at runtime. We clamp maxConcurrent to the actual
+    // pool size so the autotuner doesn't pick a concurrency the pool can't serve.
+    const uvPoolSize = parseInt(process.env["UV_THREADPOOL_SIZE"] ?? "4", 10);
+    if (uvPoolSize < 8)
+      warn(
+        `UV_THREADPOOL_SIZE=${uvPoolSize} limits runAsync concurrency to ${uvPoolSize}. ` +
+          `Set UV_THREADPOOL_SIZE=<num_cores> before starting Node for full throughput. ` +
+          `Example: UV_THREADPOOL_SIZE=24 node server.js`,
+      );
+    // Effective concurrency ceiling — we can't run more than the pool allows.
+    const poolCap = uvPoolSize;
+
+    // ── Helper: create a session + warm oneDNN ────────────────────────────────
+    const dummyShape = (inputShape as (number | null)[]).map((d) => d ?? 1);
+    const nElems = dummyShape.reduce((a, b) => a * b, 1);
+    const dummyBuf = Buffer.alloc(nElems * 4);
+    const dummyFeeds = [
+      [
+        { opName: inputOp!, index: 0 },
+        { dtype: 1 as any, shape: dummyShape, data: dummyBuf },
+      ],
+    ] as any;
+    const dummyFetches = (outputOps as string[]).map((op) => ({
+      opName: op,
+      index: 0,
+    }));
+
+    const makeSession = (intra: number, inter: number) =>
+      new Session(
+        new addon.Session(g._native, {
+          strategy: "tf-parallel",
+          reserveCores,
+          intraOpThreads: intra,
+          interOpThreads: inter,
+        }),
+      );
+
+    const warmSession = async (s: Session) => {
+      // Three warmup passes: first populates oneDNN cache, rest stabilise
+      // TF's internal thread pool and memory allocator.
+      for (let i = 0; i < AUTOTUNE_WARMUP; i++)
+        await s.runAsync(dummyFeeds, dummyFetches as any).catch(() => {});
+    };
+
+    // ── Resolve expert overrides (bypass autotuner if set) ────────────────────
+    let intra: number;
+    let inter: number;
+    let maxConcurrent: number;
+    let sess: Session;
+
+    const hasExplicitIntra = opts.intraOpThreads !== undefined;
+    const hasExplicitConc = opts.maxConcurrent !== undefined;
+
+    if (hasExplicitIntra || hasExplicitConc) {
+      // Expert mode: honour explicit values, derive the missing one.
+      // Always clamp maxConcurrent to poolCap — concurrency above the UV
+      // thread pool size queues work rather than running it in parallel.
+      if (hasExplicitIntra && hasExplicitConc) {
+        intra = opts.intraOpThreads!;
+        maxConcurrent = Math.min(opts.maxConcurrent!, poolCap);
+        if (intra * maxConcurrent > usable)
+          warn(
+            `intra(${intra}) × maxConcurrent(${maxConcurrent}) = ${
+              intra * maxConcurrent
+            } > usable(${usable}) — thread over-subscription will hurt latency`,
+          );
+      } else if (hasExplicitIntra) {
+        intra = opts.intraOpThreads!;
+        maxConcurrent = Math.min(
+          Math.max(1, Math.floor(usable / intra)),
+          poolCap,
+        );
+      } else {
+        maxConcurrent = Math.min(opts.maxConcurrent!, poolCap);
+        intra = Math.max(1, Math.floor(usable / maxConcurrent));
+      }
+      inter = opts.interOpThreads ?? Math.max(1, Math.min(4, maxConcurrent));
+      sess = makeSession(intra, inter);
+      await warmSession(sess);
+      debug(
+        `InferencePool: expert mode — intra=${intra} inter=${inter} maxConcurrent=${maxConcurrent} (UV pool=${poolCap})`,
+      );
+    } else if (profile === "latency") {
+      // Latency profile: all cores to one request at a time.
+      intra = usable;
+      maxConcurrent = 1;
+      inter = opts.interOpThreads ?? 1;
+      sess = makeSession(intra, inter);
+      await warmSession(sess);
+      debug(`InferencePool: profile=latency — intra=${intra} maxConcurrent=1`);
+    } else if (profile === "throughput") {
+      // Throughput profile: split cores for concurrent requests, capped to UV pool.
+      intra = Math.min(4, usable);
+      maxConcurrent = Math.min(
+        Math.max(1, Math.floor(usable / intra)),
+        poolCap,
+      );
+      inter = opts.interOpThreads ?? Math.min(4, maxConcurrent);
+      sess = makeSession(intra, inter);
+      await warmSession(sess);
+      debug(
+        `InferencePool: profile=throughput — intra=${intra} maxConcurrent=${maxConcurrent} (UV pool=${poolCap})`,
+      );
+    } else {
+      // ── Autotuner ──────────────────────────────────────────────────────────
+      //
+      // Scores each candidate on effective throughput = maxConcurrent / mean_ms.
+      // Tiebreaker: when two configs are within AUTOTUNE_LATENCY_PREFERENCE_MARGIN
+      // of each other, prefer higher intra (lower per-request latency).
+      //
+      // Candidates are tried low→high intra. The global oneDNN primitive cache
+      // is shared across sessions, so later candidates benefit from earlier
+      // compilations. We counter this by running more iterations (AUTOTUNE_ITERS=10)
+      // so steady-state performance dominates over cold-start noise.
+
+      // Candidates: filter to ≤ usable AND ≤ poolCap (no point in more
+      // concurrency than the libuv pool can service).
+      const candidates = AUTOTUNE_INTRA_CANDIDATES.filter((c) => c <= usable)
+        .concat(usable)
+        .filter((c, i, a) => a.indexOf(c) === i)
+        .sort((a, b) => a - b);
+
+      debug(
+        `InferencePool: autotuning ${candidates.length} configs — UV pool=${poolCap} (${AUTOTUNE_ITERS} concurrent rounds each)...`,
+      );
+
+      // Track results for tiebreaker after all candidates measured.
+      const results: {
+        rps: number;
+        meanMs: number;
+        intra: number;
+        conc: number;
+        sess: Session;
+      }[] = [];
+
+      for (const candidateIntra of candidates) {
+        // Clamp concurrency to what the UV pool can actually service.
+        const candidateConc = Math.min(
+          Math.max(1, Math.floor(usable / candidateIntra)),
+          poolCap,
+        );
+        const candidateInter = Math.max(1, Math.min(4, candidateConc));
+        const s = makeSession(candidateIntra, candidateInter);
+
+        await warmSession(s);
+
+        // ── Measure sustained throughput via sliding window pipeline ────────
+        // Issue AUTOTUNE_ITERS × candidateConc total requests, maintaining
+        // exactly candidateConc in-flight at all times (like a real workload).
+        // This correctly measures sustained req/s for all concurrency levels:
+        //   - High maxConc: concurrent memory-bus pressure is captured
+        //   - Low maxConc (e.g. 1): slot stays busy — no idle gaps between rounds
+        const totalReqs = AUTOTUNE_ITERS * Math.max(candidateConc, 1);
+        let completed = 0;
+        let issued = 0;
+        const inFlight = new Set<Promise<void>>();
+        const t0 = performance.now();
+
+        // Seed with candidateConc in-flight requests.
+        while (issued < Math.min(candidateConc, totalReqs)) {
+          const p: Promise<void> = s
+            .runAsync(dummyFeeds, dummyFetches as any)
+            .catch(() => {})
+            .then(() => {
+              completed++;
+              inFlight.delete(p);
+            });
+          inFlight.add(p);
+          issued++;
+        }
+
+        // As each completes, immediately issue the next — zero idle time.
+        while (completed < totalReqs) {
+          await Promise.race(inFlight);
+          while (issued < totalReqs && inFlight.size < candidateConc) {
+            const p: Promise<void> = s
+              .runAsync(dummyFeeds, dummyFetches as any)
+              .catch(() => {})
+              .then(() => {
+                completed++;
+                inFlight.delete(p);
+              });
+            inFlight.add(p);
+            issued++;
+          }
+        }
+
+        const elapsedMs = performance.now() - t0;
+        const rps = (totalReqs * 1000) / elapsedMs;
+        const meanMs = elapsedMs / totalReqs;
+
+        debug(
+          `  intra=${String(candidateIntra).padStart(
+            2,
+          )} maxConc=${candidateConc} inter=${candidateInter} rps=${rps.toFixed(
+            1,
+          )} mean=${meanMs.toFixed(2)}ms`,
+        );
+
+        results.push({
+          rps,
+          meanMs,
+          intra: candidateIntra,
+          conc: candidateConc,
+          sess: s,
+        });
+      }
+
+      // Best = highest measured req/s. Tiebreaker: within margin, prefer
+      // higher intra (lower per-request latency).
+      const topRps = Math.max(...results.map((r) => r.rps));
+      const threshold = topRps * (1 - AUTOTUNE_LATENCY_PREFERENCE_MARGIN);
+      const contenders = results.filter((r) => r.rps >= threshold);
+      const winner = contenders.reduce((a, b) => (a.intra > b.intra ? a : b));
+
+      for (const r of results) if (r.intra !== winner.intra) r.sess.destroy();
+
+      intra = winner.intra;
+      maxConcurrent = winner.conc;
+      inter = Math.max(1, Math.min(4, maxConcurrent));
+      sess = winner.sess;
+
+      debug(
+        `InferencePool: autotuned — intra=${intra} inter=${inter} maxConcurrent=${maxConcurrent} reserved=${reserveCores} (${
+          intra * maxConcurrent
+        }/${usable} cores) [rps=${winner.rps.toFixed(
+          1,
+        )} mean=${winner.meanMs.toFixed(1)}ms]`,
+      );
+    }
+
+    return new InferencePool({
+      graph: g,
+      sess,
+      inputOp: inputOp!,
+      outputOps: outputOps!,
+      maxQueueDepth: opts.maxQueueDepth ?? 128,
+      maxConcurrent,
+      inputShape,
+      modelPath: opts.modelPath,
+    });
+  }
+
+  // ── Public API ────────────────────────────────────────────────────────────
+
   /**
-   * Resolved input shape from the model's Placeholder op.
+   * Resolved input shape from the model Placeholder.
    * Null dims are dynamic (batch dim is typically null).
-   * Use this to allocate correctly-sized input buffers for infer().
+   * Use this to allocate correctly-sized input buffers.
    */
   get resolvedInputShape(): (number | null)[] {
     return this._inputShape;
   }
 
-  // ── Factory ────────────────────────────────────────────────────────────────
-
-  static async create(opts: PoolOptions): Promise<InferencePool> {
-    // ── Auto-discover inputOp / outputOps if not provided ──────────────────
-    if (!opts.inputOp || !opts.outputOps?.length) {
-      const { getAddon } = await import("./_native.js");
-      const { Graph: GCls } = await import("./graph.js");
-      const addon = getAddon();
-      const g = new GCls(new addon.Graph());
-      g.importGraphDef(readFileSync(opts.modelPath));
-
-      if (!opts.inputOp) {
-        const placeholders = g.listOpsOfType("Placeholder");
-        if (!placeholders.length)
-          throw new Error(`No Placeholder ops found in ${opts.modelPath}`);
-        opts.inputOp = placeholders[0];
-      }
-      if (!opts.outputOps?.length) {
-        const sinks = g.listSinkOps();
-        if (!sinks.length)
-          throw new Error(`No sink ops found in ${opts.modelPath}`);
-        opts.outputOps = sinks;
-      }
-      if (!opts._resolvedInputShape) {
-        const rawShape = g._native.opOutputShape(opts.inputOp, 0) as
-          | number[]
-          | null;
-        opts._resolvedInputShape = rawShape
-          ? rawShape.map((d: number) => (d < 0 ? null : d))
-          : [null];
-      }
-    }
-    if (!opts._resolvedInputShape) {
-      const { getAddon } = await import("./_native.js");
-      const { Graph: GCls } = await import("./graph.js");
-      const addon = getAddon();
-      const g = new GCls(new addon.Graph());
-      g.importGraphDef(readFileSync(opts.modelPath));
-      const rawShape = g._native.opOutputShape(opts.inputOp!, 0) as
-        | number[]
-        | null;
-      opts._resolvedInputShape = rawShape
-        ? rawShape.map((d: number) => (d < 0 ? null : d))
-        : [null];
-    }
-
-    const requestedStrategy = opts.strategy ?? "auto";
-    const concurrency = opts.concurrency ?? availableParallelism();
-    const autoThreshold = opts.autoThresholdMs ?? DEFAULT_AUTO_THRESHOLD;
-    const reserveCores = opts.reserveCores ?? 0;
-    const maxInputBytes = opts.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
-    const maxQueueDepth = opts.maxQueueDepth ?? Infinity;
-    const numaAware = opts.numaAware ?? false;
-
-    let resolved: "worker-pool" | "tf-parallel";
-
-    if (requestedStrategy === "worker-pool") {
-      resolved = "worker-pool";
-    } else if (requestedStrategy === "tf-parallel") {
-      resolved = "tf-parallel";
-    } else {
-      const modelBytes = statSync(opts.modelPath).size;
-
-      if (modelBytes < SIZE_THRESHOLD_BYTES) {
-        resolved = "worker-pool";
-      } else if (!opts.probeShape) {
-        resolved = "tf-parallel";
-      } else {
-        const { getAddon } = await import("./_native.js");
-        const { Graph: GCls } = await import("./graph.js");
-        const addon = getAddon();
-        const probeG = new GCls(new addon.Graph());
-        probeG.importGraphDef(readFileSync(opts.modelPath));
-        const probeSess = new addon.Session(probeG._native, {
-          strategy: "worker-pool",
-          reserveCores: 0,
-        });
-
-        const probeElems = opts.probeShape.reduce(
-          (a: number, b: number) => a * b,
-          1,
-        );
-        const probeInput = Buffer.alloc(probeElems * 4);
-        const probeFeeds = [
-          {
-            opName: opts.inputOp,
-            index: 0,
-            tensor: { dtype: 1, shape: opts.probeShape, data: probeInput },
-          },
-        ];
-        const probeFetches = opts.outputOps!.map((op: string) => ({
-          opName: op,
-          index: 0,
-        }));
-
-        await probeSess.runAsync(probeFeeds, probeFetches);
-        const t0 = performance.now();
-        await probeSess.runAsync(probeFeeds, probeFetches);
-        const probeMs = performance.now() - t0;
-        probeSess.destroy();
-
-        resolved = probeMs >= autoThreshold ? "tf-parallel" : "worker-pool";
-      }
-    }
-
-    return resolved === "worker-pool"
-      ? InferencePool.createWorkerPool(
-          opts,
-          concurrency,
-          reserveCores,
-          maxInputBytes,
-          maxQueueDepth,
-          numaAware,
-        )
-      : InferencePool.createTfParallel(opts, reserveCores, maxQueueDepth);
+  /** Number of requests currently queued (waiting for the session). */
+  get queueDepth(): number {
+    return this.queue.length;
   }
 
-  // ── worker-pool init ───────────────────────────────────────────────────────
-
-  private static async createWorkerPool(
-    opts: PoolOptions,
-    concurrency: number,
-    reserveCores: number,
-    maxInputBytes: number,
-    maxQueueDepth: number,
-    numaAware: boolean,
-  ): Promise<InferencePool> {
-    const ctrlSab = new SharedArrayBuffer(concurrency * CTRL_SLOTS * 4);
-    const slots: WorkerSlot[] = [];
-    const startedWorkers: Worker[] = [];
-
-    const isTsSource = import.meta.url.endsWith(".ts");
-    const workerEntry = isTsSource
-      ? new URL("./inference-pool-worker.mjs", import.meta.url)
-      : new URL("./inference-pool.js", import.meta.url);
-
-    try {
-      for (let i = 0; i < concurrency; i++) {
-        const ctrl = new Int32Array(ctrlSab, i * CTRL_SLOTS * 4, CTRL_SLOTS);
-        Atomics.store(ctrl, 0, IDLE);
-
-        const seg = SharedTensorSegment.createShared(maxInputBytes);
-        const segSab = seg.sharedBuffer;
-
-        const worker = new Worker(workerEntry, {
-          workerData: {
-            ctrlSab,
-            segSab,
-            maxInputBytes,
-            workerIndex: i,
-            totalWorkers: concurrency,
-            modelPath: opts.modelPath,
-            inputOp: opts.inputOp,
-            outputOps: opts.outputOps,
-            reserveCores,
-            numaNode: numaAware ? i % 2 : -1,
-          },
-        });
-        startedWorkers.push(worker);
-
-        await new Promise<void>((resolve, reject) => {
-          worker.once("message", (msg: any) => {
-            if (msg.type === "ready") resolve();
-            else if (msg.type === "init_error")
-              reject(new Error(`Worker ${i} init failed: ${msg.error}`));
-            else
-              reject(
-                new Error(`Worker ${i} unexpected init message: ${msg.type}`),
-              );
-          });
-          worker.once("error", reject);
-        });
-
-        slots.push({
-          worker,
-          ctrl,
-          seg,
-          busy: false,
-          resolve: null,
-          reject: null,
-        });
-      }
-    } catch (err) {
-      await Promise.allSettled(startedWorkers.map((w) => w.terminate()));
-      throw err;
-    }
-
-    return new InferencePool({
-      strategy: "worker-pool",
-      reserveCores,
-      workerSlots: slots,
-      queue: [],
-      maxQueueDepth,
-      ctrlSab,
-      tfParallelGraph: null,
-      tfParallelSess: null,
-      modelPath: opts.modelPath,
-      inputOp: opts.inputOp!,
-      outputOps: opts.outputOps!,
-      inputShape: opts._resolvedInputShape ?? [null],
-    });
-  }
-
-  // ── tf-parallel init ───────────────────────────────────────────────────────
-
-  private static async createTfParallel(
-    opts: PoolOptions,
-    reserveCores: number,
-    maxQueueDepth: number,
-  ): Promise<InferencePool> {
-    const hw = availableParallelism();
-    const tfCores = Math.max(1, hw - reserveCores);
-
-    const { getAddon } = await import("./_native.js");
-    const { Graph: GCls } = await import("./graph.js");
-    const { Session: SCls } = await import("./session.js");
-    const addon = getAddon();
-
-    const g = new GCls(new addon.Graph());
-    g.importGraphDef(readFileSync(opts.modelPath));
-
-    const sess = new SCls(
-      new addon.Session(g._native, {
-        strategy: "tf-parallel",
-        reserveCores,
-      }),
-    );
-
-    return new InferencePool({
-      strategy: "tf-parallel",
-      reserveCores,
-      workerSlots: [],
-      queue: [],
-      maxQueueDepth,
-      ctrlSab: null,
-      tfParallelGraph: g,
-      tfParallelSess: sess,
-      modelPath: opts.modelPath,
-      inputOp: opts.inputOp!,
-      outputOps: opts.outputOps!,
-      inputShape: opts._resolvedInputShape ?? [null],
-    });
-  }
-
-  // ── Inference ──────────────────────────────────────────────────────────────
-
+  /**
+   * infer — submit an inference request.
+   *
+   * Runs immediately if the session is idle. Otherwise queues the request
+   * (FIFO). Throws QueueFullError synchronously if maxQueueDepth is reached.
+   *
+   * @param inputBuf   Raw tensor bytes
+   * @param inputShape [batchSize, ...dims]
+   * @param inputDtype TF DType integer (1=FLOAT32, 3=INT32, ...)
+   */
   infer(
     inputBuf: Buffer,
     inputShape: number[],
-    inputDtype = 1,
+    inputDtype: number = 1, // TF_FLOAT
   ): Promise<PoolResult> {
-    return this.strategy === "worker-pool"
-      ? this.inferWorkerPool(inputBuf, inputShape, inputDtype)
-      : this.inferTfParallel(inputBuf, inputShape, inputDtype);
-  }
+    if (this.destroyed)
+      return Promise.reject(new Error("InferencePool has been destroyed"));
 
-  private inferWorkerPool(
-    inputBuf: Buffer,
-    inputShape: number[],
-    inputDtype: number,
-  ): Promise<PoolResult> {
-    return new Promise((resolve, reject) => {
-      const slot = this.workerSlots.find((w) => !w.busy);
-      if (slot) {
-        this.dispatchToWorker(
-          slot,
-          inputBuf,
-          inputShape,
-          inputDtype,
-          resolve,
-          reject,
-        );
-      } else if (this.queue.length >= this.maxQueueDepth) {
-        reject(new QueueFullError(this.queue.length, this.maxQueueDepth));
-      } else {
-        this.queue.push({ inputBuf, inputShape, inputDtype, resolve, reject });
-      }
+    // Dispatch immediately if a concurrent slot is available.
+    // Multiple runAsync() calls on the same session are safe — TF's inter-op
+    // scheduler overlaps independent ops across concurrent requests, which
+    // is how tfjs-node achieves sub-linear latency scaling at high concurrency.
+    if (this.active < this.maxConcurrent)
+      return this._run(inputBuf, inputShape, inputDtype);
+
+    // All slots occupied — queue the request.
+    if (this.queue.length >= this.maxQueueDepth)
+      throw new QueueFullError(this.queue.length);
+
+    return new Promise<PoolResult>((resolve, reject) => {
+      this.queue.push({ inputBuf, inputShape, inputDtype, resolve, reject });
     });
   }
 
-  private dispatchToWorker(
-    slot: WorkerSlot,
+  private async _run(
     inputBuf: Buffer,
     inputShape: number[],
     inputDtype: number,
-    resolve: (r: PoolResult) => void,
-    reject: (e: Error) => void,
-  ) {
-    const workerId = this.workerSlots.indexOf(slot);
-    slot.busy = true;
-    slot.resolve = resolve;
-    slot.reject = reject;
+  ): Promise<PoolResult> {
+    this.active++;
+    const t0 = performance.now();
+    try {
+      const feeds = [
+        [
+          { opName: this.inputOp, index: 0 },
+          { dtype: inputDtype as DType, shape: inputShape, data: inputBuf },
+        ],
+      ] as [any, FeedValue][];
 
-    // Register result listener BEFORE writing data or signalling WORK.
-    const handleMessage = (msg: any) => {
-      if (msg.type === "work_error") {
-        this.settleSlot(slot, null, new Error(msg.error));
-        return;
-      }
-      if (msg.type !== "result") {
-        slot.worker.once("message", handleMessage);
-        return;
-      }
-      this.settleSlot(
-        slot,
-        {
-          workerId,
-          strategy: "worker-pool",
-          outputs: msg.outputs.map((o: any) => ({
-            dtype: o.dtype,
-            shape: o.shape,
-            // postMessage structured-clones Buffer as Uint8Array — rewrap.
-            data: Buffer.isBuffer(o.data) ? o.data : Buffer.from(o.data),
-          })),
-          inferenceMs: msg.inferenceMs,
-        },
-        null,
-      );
-    };
-    // Bind both handlers together so the error listener is removed when the
-    // message fires (and vice versa). Without this, each successful request
-    // permanently accumulates a ".once error" listener on the Worker — after
-    // 10 requests Node.js warns about a possible EventEmitter memory leak.
-    const onError = (err: Error) => {
-      slot.worker.removeListener("message", handleMessage);
-      this.settleSlot(slot, null, err);
-    };
-    const handleMessageAndClean = (msg: any) => {
-      slot.worker.removeListener("error", onError);
-      handleMessage(msg);
-    };
-    slot.worker.once("message", handleMessageAndClean);
-    slot.worker.once("error", onError);
-
-    // Zero-copy write — seqlock ensures the Worker sees a consistent snapshot.
-    slot.seg.write(inputShape, tfDtypeToJudeMap(inputDtype), inputBuf);
-    Atomics.store(slot.ctrl, 0, WORK);
-    Atomics.notify(slot.ctrl, 0, 1);
+      const fetches = this.outputOps.map((op) => ({ opName: op, index: 0 }));
+      const outputs = await this.sess.runAsync(feeds as any, fetches as any);
+      return { outputs, inferenceMs: performance.now() - t0 };
+    } finally {
+      this.active--;
+      this._drain();
+    }
   }
 
-  private settleSlot(
-    slot: WorkerSlot,
-    result: PoolResult | null,
-    err: Error | null,
-  ) {
-    const resolve = slot.resolve;
-    const reject = slot.reject;
-    slot.busy = false;
-    slot.resolve = null;
-    slot.reject = null;
-
-    if (err) reject?.(err);
-    else resolve?.(result!);
-
-    const next = this.queue.shift();
-    if (next)
-      this.dispatchToWorker(
-        slot,
-        next.inputBuf,
-        next.inputShape,
-        next.inputDtype,
+  private _drain(): void {
+    // Dispatch as many queued requests as concurrent slots allow.
+    while (
+      this.queue.length > 0 &&
+      this.active < this.maxConcurrent &&
+      !this.destroyed
+    ) {
+      const next = this.queue.shift()!;
+      this._run(next.inputBuf, next.inputShape, next.inputDtype).then(
         next.resolve,
         next.reject,
       );
-  }
-
-  // ── tf-parallel path ───────────────────────────────────────────────────────
-
-  private inferTfParallel(
-    inputBuf: Buffer,
-    inputShape: number[],
-    inputDtype: number,
-  ): Promise<PoolResult> {
-    return new Promise((resolve, reject) => {
-      if (this.tfParallelBusy) {
-        if (this.tfParallelQueue.length >= this.maxQueueDepth) {
-          reject(
-            new QueueFullError(this.tfParallelQueue.length, this.maxQueueDepth),
-          );
-          return;
-        }
-        this.tfParallelQueue.push({
-          inputBuf,
-          inputShape,
-          inputDtype,
-          resolve,
-          reject,
-        });
-        return;
-      }
-      this.runTfParallel(inputBuf, inputShape, inputDtype, resolve, reject);
-    });
-  }
-
-  private runTfParallel(
-    inputBuf: Buffer,
-    inputShape: number[],
-    inputDtype: number,
-    resolve: (r: PoolResult) => void,
-    reject: (e: Error) => void,
-  ) {
-    this.tfParallelBusy = true;
-    const t0 = performance.now();
-
-    const g = this.tfParallelGraph!;
-    const inputTensor = g.getOp(this.inputOp);
-    if (!inputTensor) {
-      this.tfParallelBusy = false;
-      reject(new Error(`tf-parallel: input op not found: ${this.inputOp}`));
-      return;
     }
-    const outputTensors = this.outputOps.map((name) => {
-      const t = g.getOp(name);
-      if (!t) throw new Error(`tf-parallel: output op not found: ${name}`);
-      return t;
-    });
-
-    const feedValue = {
-      dtype: inputDtype,
-      shape: inputShape,
-      data: inputBuf,
-    };
-
-    this.tfParallelSess!.runAsync([[inputTensor, feedValue]], outputTensors)
-      .then((outputs: any[]) => {
-        const inferenceMs = performance.now() - t0;
-        this.tfParallelBusy = false;
-        resolve({
-          workerId: 0,
-          strategy: "tf-parallel",
-          outputs: outputs.map((o) => ({
-            dtype: o.dtype,
-            shape: o.shape,
-            data: Buffer.isBuffer(o.data) ? o.data : Buffer.from(o.data),
-          })),
-          inferenceMs,
-        });
-        const next = this.tfParallelQueue.shift();
-        if (next)
-          this.runTfParallel(
-            next.inputBuf,
-            next.inputShape,
-            next.inputDtype,
-            next.resolve,
-            next.reject,
-          );
-      })
-      .catch((err: Error) => {
-        this.tfParallelBusy = false;
-        reject(err);
-        const next = this.tfParallelQueue.shift();
-        if (next)
-          this.runTfParallel(
-            next.inputBuf,
-            next.inputShape,
-            next.inputDtype,
-            next.resolve,
-            next.reject,
-          );
-      });
   }
 
-  // ── Introspection ──────────────────────────────────────────────────────────
+  /**
+   * runBatch — process an array of inputs through the pool in order.
+   *
+   * Designed for offline batch processing (CLI tools, data pipelines) where
+   * you want to pipeline work through the pool without per-item async overhead.
+   * All items share the same shape and dtype.
+   *
+   * Internally submits all items via infer() in parallel up to maxConcurrent,
+   * then collects results in submission order. The event loop stays free
+   * throughout — this is not a synchronous blocking call.
+   *
+   * @param inputs     Array of raw tensor buffers (one per item)
+   * @param inputShape Shape for every item in the batch (same for all)
+   * @param inputDtype TF dtype integer (default: 1 = FLOAT32)
+   * @returns          Results in the same order as inputs
+   *
+   * @example
+   * const results = await pool.runBatch(
+   *   images.map(img => img.buffer),
+   *   [1, 224, 224, 3],
+   * );
+   */
+  async runBatch(
+    inputs: Buffer[],
+    inputShape: number[],
+    inputDtype: number = 1,
+  ): Promise<PoolResult[]> {
+    if (this.destroyed) throw new Error("InferencePool has been destroyed");
+    if (inputs.length === 0) return [];
 
-  get busyCount(): number {
-    if (this.strategy === "worker-pool")
-      return this.workerSlots.filter((w) => w.busy).length;
-    return this.tfParallelBusy ? 1 : 0;
+    // Submit all items concurrently (pool enforces maxConcurrent internally).
+    // We track promises in submission order to return results sorted correctly.
+    const promises = inputs.map((buf) =>
+      this.infer(buf, inputShape, inputDtype),
+    );
+    return Promise.all(promises);
   }
 
-  get queueDepth(): number {
-    return this.strategy === "worker-pool"
-      ? this.queue.length
-      : this.tfParallelQueue.length;
-  }
-
-  get size(): number {
-    return this.strategy === "worker-pool" ? this.workerSlots.length : 1;
-  }
-
-  // ── Lifecycle ──────────────────────────────────────────────────────────────
-
+  /**
+   * destroy — reject all queued requests and close the TF session.
+   */
   async destroy(): Promise<void> {
-    if (this.strategy === "worker-pool") {
-      await Promise.all(
-        this.workerSlots.map(
-          (slot) =>
-            new Promise<void>((resolve, reject) => {
-              const doShutdown = () => {
-                slot.worker.once("message", (msg: any) => {
-                  if (msg.type === "shutdown_ack") {
-                    slot.seg.destroy();
-                    resolve();
-                  }
-                });
-                slot.worker.once("error", reject);
-                Atomics.store(slot.ctrl, 0, SHUTDOWN);
-                Atomics.notify(slot.ctrl, 0, 1);
-              };
-              if (slot.busy) {
-                const origResolve = slot.resolve;
-                const origReject = slot.reject;
-                slot.resolve = (r) => {
-                  origResolve?.(r);
-                  doShutdown();
-                };
-                slot.reject = (e) => {
-                  origReject?.(e);
-                  doShutdown();
-                };
-              } else {
-                doShutdown();
-              }
-            }),
-        ),
-      );
-    } else {
-      if (this.tfParallelBusy) {
-        await new Promise<void>((res) => {
-          const t = setInterval(() => {
-            if (!this.tfParallelBusy) {
-              clearInterval(t);
-              res();
-            }
-          }, 1);
-        });
-      }
-      this.tfParallelSess?.destroy();
-      this.tfParallelSess = null;
-      this.tfParallelGraph = null;
-    }
+    if (this.destroyed) return;
+    this.destroyed = true;
+
+    const err = new Error("InferencePool destroyed");
+    while (this.queue.length > 0) this.queue.shift()!.reject(err);
+
+    this.sess.destroy();
   }
 }

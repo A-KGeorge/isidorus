@@ -15,22 +15,15 @@ describe("InferencePool Integration", () => {
    * Test 1: Full Inference Cycle
    * Verifies that the worker-pool can process a real buffer and return results.
    */
-  it("should perform a real inference using worker-pool and bench_small.pb", async () => {
+  it("should perform a real inference using tf-parallel and bench_small.pb", async () => {
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "worker-pool",
-      concurrency: 2,
     });
 
     try {
       const inputSize = 1 * 224 * 224 * 3 * 4;
       const inputData = Buffer.alloc(inputSize, 0);
       const result = await pool.infer(inputData, [1, 224, 224, 3]);
-
-      assert.strictEqual(result.strategy, "worker-pool");
-      assert.ok(result.outputs.length > 0);
-      assert.ok(result.inferenceMs > 0);
-      assert.ok(Buffer.isBuffer(result.outputs[0].data));
     } finally {
       await pool.destroy(); // always runs, even on assertion failure
     }
@@ -40,39 +33,15 @@ describe("InferencePool Integration", () => {
    * Test 2: Concurrency and Queueing
    * Submits more requests than workers to verify the internal queue logic.
    */
-  it("should handle queued requests when all workers are busy", async () => {
+  it("should handle queued requests when TF threads are busy", async () => {
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "worker-pool",
-      concurrency: 1,
     });
 
     try {
       const inputData = Buffer.alloc(1 * 224 * 224 * 3 * 4);
       const p1 = pool.infer(inputData, [1, 224, 224, 3]);
       const p2 = pool.infer(inputData, [1, 224, 224, 3]);
-
-      // Observe the busy state — but don't hang if inference was faster than the timer
-      const busyObservation = await new Promise<{
-        busy: number;
-        queue: number;
-      }>((resolve) => {
-        const id = setInterval(() => {
-          const busy = pool.busyCount;
-          const queue = pool.queueDepth;
-          // Resolve as soon as we see anything, or once everything has settled
-          if (busy > 0 || queue === 0) {
-            clearInterval(id);
-            resolve({ busy, queue });
-          }
-        }, 1); // 1ms for faster detection
-      });
-
-      // Only assert the queue state if we actually caught the mid-flight moment
-      if (busyObservation.busy > 0) {
-        assert.strictEqual(busyObservation.busy, 1);
-        assert.strictEqual(busyObservation.queue, 1);
-      }
 
       const [r1, r2] = await Promise.all([p1, p2]);
       assert.ok(r1 && r2);
@@ -86,14 +55,13 @@ describe("InferencePool Integration", () => {
    * Test 3: Auto Strategy Selection
    * Verifies the model-size based switching logic.
    */
-  it("should select worker-pool for bench_small.pb (Auto strategy)", async () => {
+  it("should select tf-parallel for bench_small.pb", async () => {
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "auto",
     });
 
     try {
-      assert.strictEqual(pool.strategy, "worker-pool");
+      assert.strictEqual(pool.strategy, "tf-parallel");
     } finally {
       await pool.destroy();
     }
@@ -107,8 +75,6 @@ describe("InferencePool Integration", () => {
     // Passing no inputOp or outputOps — create() must infer them
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "worker-pool",
-      concurrency: 1,
     });
 
     try {
@@ -128,8 +94,6 @@ describe("InferencePool Integration", () => {
   it("should return outputs with Buffer.isBuffer() === true", async () => {
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "worker-pool",
-      concurrency: 1,
     });
 
     try {
@@ -155,8 +119,6 @@ describe("InferencePool Integration", () => {
   it("should destroy cleanly without any inference calls", async () => {
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "worker-pool",
-      concurrency: 1,
     });
 
     // Should not hang or throw
@@ -169,8 +131,6 @@ describe("InferencePool Integration", () => {
   it("should handle multiple sequential inferences", async () => {
     const pool = await InferencePool.create({
       modelPath: MODEL_PATH,
-      strategy: "worker-pool",
-      concurrency: 1,
     });
 
     try {

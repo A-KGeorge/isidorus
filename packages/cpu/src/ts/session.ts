@@ -1,5 +1,6 @@
 import type { Tensor } from "@isidorus/core";
-import { DType } from "@isidorus/core";
+import { DType, ShapeFromTF } from "@isidorus/core";
+import type { Graph } from "./graph.js";
 
 /**
  * Options for Session construction.
@@ -29,12 +30,6 @@ export interface SessionOptions {
    * Default: 2. Set to 0 to let TF choose automatically.
    */
   interOpThreads?: number;
-
-  /**
-   * The NUMA node layout to pin this session's threads to.
-   * Defaults to undefined (disabled) - handled internally by OS scheduling.
-   */
-  numaNode?: number;
 }
 
 /** Raw tensor value passed as a feed. */
@@ -105,7 +100,7 @@ export class Session {
 
   /**
    * Synchronous inference — blocks the event loop during TF_SessionRun.
-   * Use on Worker threads. On the main thread prefer runAsync().
+   * Use on Worker threads or in training loops. On the main thread prefer runAsync().
    *
    * @param feeds    Array of [Tensor, FeedValue] pairs
    * @param fetches  Tensors to compute and return
@@ -123,6 +118,37 @@ export class Session {
       nativeFetches,
       targets,
     )) as any[];
+    return raw.map(fromNativeOutput);
+  }
+
+  /**
+   * Truly synchronous inference — calls TF_SessionRun directly on the calling
+   * thread with zero libuv, TSFN, or Promise overhead.
+   *
+   * Blocks the event loop completely. Only appropriate when the event loop is
+   * intentionally surrendered — i.e. training loops, CLI scripts, batch jobs.
+   * Never call this from an HTTP request handler.
+   *
+   * For training this is the correct choice: it matches Python TF's
+   * sess.run() exactly, with TF's eigen thread pool still providing
+   * internal parallelism via intraOpThreads.
+   *
+   * @param feeds    Array of [Tensor, FeedValue] pairs
+   * @param fetches  Tensors to compute and return
+   * @param targets  Op names to run for side-effects only
+   */
+  runSync(
+    feeds: [Tensor, FeedValue][],
+    fetches: Tensor[],
+    targets: string[] = [],
+  ): TensorValue[] {
+    const nativeFeeds = feeds.map(([t, v]) => toNativeFeed(t, v));
+    const nativeFetches = fetches.map(toNativeFetch);
+    // this._native.run() is a synchronous Napi method — calling without await
+    // invokes TF_SessionRun directly on the calling thread (no libuv scheduling,
+    // no TSFN round-trip, no microtask queue). TF's eigen thread pool handles
+    // internal op parallelism regardless.
+    const raw = this._native.run(nativeFeeds, nativeFetches, targets) as any[];
     return raw.map(fromNativeOutput);
   }
 

@@ -135,8 +135,9 @@ export class SGD {
         );
 
         // Sequence v-assign → w-assign via a controlling NoOp.
-        g.addOp("NoOp", [], {}, `${name}/sgd_seq`, [vAssign, wAssign]);
-        this.updateOps.push(`${name}/sgd_seq`);
+        const seqName = `${name}/sgd_seq`;
+        g.addOp("NoOp", [], {}, seqName, [vAssign, wAssign]);
+        this.updateOps.push(seqName);
       }
     }
   }
@@ -158,6 +159,14 @@ export class SGD {
       await sess.run([], [], [this.initOpName]);
     }
     this.initialised = true;
+  }
+
+  /**
+   * targetOps — the op names that constitute one SGD step.
+   * Exposed so trainStep can merge forward + backward into a single runAsync.
+   */
+  get targetOps(): string[] {
+    return this.updateOps;
   }
 
   /**

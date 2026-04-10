@@ -110,6 +110,11 @@ export class RMSProp {
     this.initialised = true;
   }
 
+  /** targetOps — exposed so trainStep can merge forward + backward into a single runAsync. */
+  get targetOps(): string[] {
+    return this.updateOps;
+  }
+
   async applyGradients(sess: Session, feeds: FeedEntry[]): Promise<void> {
     await sess.run(feeds, [], this.updateOps);
   }

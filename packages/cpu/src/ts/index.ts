@@ -48,6 +48,10 @@ try {
 
 import { setAddon } from "./_native.js";
 setAddon(IsidorusAddon);
+export { getAddon } from "./_native.js";
+export * from "./ops/index.js";
+export * from "./optimizers/index.js";
+export * from "./model/index.js";
 
 // ── Re-export core types ─────────────────────────────────────────────────────
 export type { Tensor, Shape } from "@isidorus/core";

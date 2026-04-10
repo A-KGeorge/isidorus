@@ -94,6 +94,16 @@ export class Graph {
         ),
       );
     }
+
+    // Side-effect-only ops (NoOp, AssignVariableOp, ResourceApply*) have
+    // numOutputs === 0 so the tensors array is empty. Callers that use the
+    // pattern `const [t] = g.addOp(...)` to get the op name would see t=undefined.
+    // Provide a sentinel at index -1 carrying just the opName so those callers work:
+    //   const [t] = g.addOp("NoOp", ...);  t.opName → the NoOp's name ✓
+    if (numOutputs === 0) {
+      tensors.push(makeTensor(opName, -1, null, null));
+    }
+
     return tensors;
   }
 
@@ -133,6 +143,33 @@ export class Graph {
   /** Whether an op with the given name exists in this graph. */
   hasOp(name: string): boolean {
     return this._native.hasOp(name) as boolean;
+  }
+
+  /**
+   * getOp — look up a Tensor descriptor by op name.
+   *
+   * Returns the Tensor at the specified output index, or null if the op
+   * does not exist in the graph. Use this to reconnect to an op after
+   * importGraphDef() or to build feeds/fetches by name rather than by
+   * reference.
+   *
+   * @param name         Op name (e.g. "inputs", "conv1/relu")
+   * @param outputIndex  Which output to return (default 0)
+   */
+  getOp(name: string, outputIndex = 0): Tensor | null {
+    if (!this.hasOp(name)) return null;
+    const tfDtype = this._native.opOutputType(name, outputIndex) as
+      | number
+      | null;
+    const tfShape = this._native.opOutputShape(name, outputIndex) as
+      | number[]
+      | null;
+    return makeTensor(
+      name,
+      outputIndex,
+      tfDtype != null ? (tfDtype as DType) : null,
+      tfShape != null ? ShapeFromTF(tfShape) : null,
+    );
   }
 
   /** Total number of ops in the graph. */
@@ -178,17 +215,5 @@ export class Graph {
    */
   listSinkOps(): string[] {
     return this._native.listSinkOps() as string[];
-  }
-
-  getOp(name: string, index = 0): Tensor | null {
-    if (!this._native.hasOp(name)) return null;
-    const tfDtype = this._native.opOutputType(name, index) as number | null;
-    const tfShape = this._native.opOutputShape(name, index) as number[] | null;
-    return makeTensor(
-      name,
-      index,
-      tfDtype != null ? (tfDtype as DType) : null,
-      tfShape != null ? ShapeFromTF(tfShape) : null,
-    );
   }
 }
