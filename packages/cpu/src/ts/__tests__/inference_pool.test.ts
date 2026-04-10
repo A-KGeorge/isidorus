@@ -1,9 +1,12 @@
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
+import { writeFileSync, existsSync, rmSync } from "node:fs";
 import "../index.js"; // Initialize native addon
 import { InferencePool } from "../inference-pool.js";
+import { toonEncode, toonDecode } from "../toon.js";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { buildSmallGraph } from "./fixtures/generate_small.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -11,6 +14,56 @@ const __dirname = dirname(__filename);
 const MODEL_PATH = join(__dirname, "fixtures", "bench_small.pb");
 
 describe("InferencePool Integration", () => {
+  after(() => {
+    if (existsSync(MODEL_PATH)) {
+      rmSync(MODEL_PATH, { force: true });
+    }
+  });
+
+  /**
+   * Test 0: Generate the bench_small.pb fixture
+   * Using the provided generate_models API equivalents.
+   */
+  it("should generate bench_small.pb and save it to fixtures", async () => {
+    const g = buildSmallGraph();
+    const pbDef = g.toGraphDef();
+    writeFileSync(MODEL_PATH, pbDef);
+    assert.ok(existsSync(MODEL_PATH));
+  });
+
+  /**
+   * Test 0.5: Toon encoding/decoding test
+   * Tests the uncommitted toon string functionality to correctly serialize and deserialize.
+   */
+  it("should encode and decode data correctly using toon", async () => {
+    const testObject = {
+      version: 1,
+      inputShape: [1, 224, 224, 3],
+      tags: ["vision", "mobile", "fast"],
+      params: { count: 3500000, optimized: true },
+      empty: null,
+      floating: 3.1415,
+      magic_buffer: Buffer.from("hello world"),
+    };
+
+    // Encode using toon
+    const encoded = toonEncode(testObject);
+    assert.ok(Buffer.isBuffer(encoded));
+    assert.ok(encoded.length > 4); // basic size check
+
+    // Decode mapping back
+    const decoded = toonDecode(encoded) as typeof testObject;
+
+    assert.strictEqual(decoded.version, testObject.version);
+    assert.deepEqual(decoded.inputShape, testObject.inputShape);
+    assert.deepEqual(decoded.tags, testObject.tags);
+    assert.strictEqual(decoded.params.count, testObject.params.count);
+    assert.strictEqual(decoded.params.optimized, testObject.params.optimized);
+    assert.strictEqual(decoded.empty, testObject.empty);
+    assert.strictEqual(decoded.floating, testObject.floating);
+    assert.ok(Buffer.isBuffer(decoded.magic_buffer));
+    assert.strictEqual(decoded.magic_buffer.toString(), "hello world");
+  });
   /**
    * Test 1: Full Inference Cycle
    * Verifies that the worker-pool can process a real buffer and return results.

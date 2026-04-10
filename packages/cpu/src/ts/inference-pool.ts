@@ -116,8 +116,13 @@ const AUTOTUNE_INTRA_CANDIDATES = [1, 2, 4, 8, 16, 32];
 
 // Iterations per candidate. More = stable but slower startup.
 // 3 warmup + 10 timed ≈ 300–500ms total on typical hardware.
+// For large models (>= AUTOTUNE_LARGE_MODEL_BYTES) we halve this to reduce
+// cold-start time — the oneDNN primitive cache dominates for large models so
+// fewer iterations still give a reliable winner.
 const AUTOTUNE_WARMUP = 3;
 const AUTOTUNE_ITERS = 10;
+const AUTOTUNE_ITERS_LARGE = 5;
+const AUTOTUNE_LARGE_MODEL_BYTES = 50 * 1024 * 1024; // 50 MB
 
 // When two configs are within this fraction of each other in throughput score,
 // prefer the one with higher intraOpThreads (= lower per-request latency).
@@ -179,6 +184,9 @@ export class InferencePool {
   static async create(opts: PoolOptions): Promise<InferencePool> {
     const addon = getAddon();
     const g = new Graph(new addon.Graph());
+
+    // Read model size before importing — used for autotuner iteration scaling.
+    const modelBytes = statSync(opts.modelPath).size;
     g.importGraphDef(readFileSync(opts.modelPath));
 
     // Auto-discover inputOp and outputOps.
@@ -343,8 +351,21 @@ export class InferencePool {
         .filter((c, i, a) => a.indexOf(c) === i)
         .sort((a, b) => a - b);
 
+      // Large models have a longer oneDNN cold-start per candidate. Reduce
+      // iterations to keep total autotuner time under ~10s for 100MB+ models.
+      const autotuneIters =
+        modelBytes >= AUTOTUNE_LARGE_MODEL_BYTES
+          ? AUTOTUNE_ITERS_LARGE
+          : AUTOTUNE_ITERS;
+
       debug(
-        `InferencePool: autotuning ${candidates.length} configs — UV pool=${poolCap} (${AUTOTUNE_ITERS} concurrent rounds each)...`,
+        `InferencePool: autotuning ${
+          candidates.length
+        } configs — UV pool=${poolCap} (${autotuneIters} concurrent rounds each, model=${(
+          modelBytes /
+          1024 /
+          1024
+        ).toFixed(1)}MB)...`,
       );
 
       // Track results for tiebreaker after all candidates measured.
@@ -373,7 +394,7 @@ export class InferencePool {
         // This correctly measures sustained req/s for all concurrency levels:
         //   - High maxConc: concurrent memory-bus pressure is captured
         //   - Low maxConc (e.g. 1): slot stays busy — no idle gaps between rounds
-        const totalReqs = AUTOTUNE_ITERS * Math.max(candidateConc, 1);
+        const totalReqs = autotuneIters * Math.max(candidateConc, 1);
         let completed = 0;
         let issued = 0;
         const inFlight = new Set<Promise<void>>();

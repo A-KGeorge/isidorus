@@ -114,6 +114,62 @@ export function session(
 // ── Ops namespace ─────────────────────────────────────────────────────────────
 export * as ops from "./ops/index.js";
 
+// ── Model API ────────────────────────────────────────────────────
+export { toonEncode, toonDecode } from "./toon.js";
+export * as arch from "./arch.js";
+export {
+  glorotBuffer,
+  heNormalBuffer,
+  zerosBuffer,
+  onesBuffer,
+  constGlorot,
+  constHe,
+  constZeros,
+  constOnes,
+  frozenBatchNorm,
+  convBnRelu,
+  convBnRelu6,
+  depthwiseBnRelu6,
+  pointwiseBn,
+  residualBlock,
+  projectionBlock,
+  invertedResidual,
+} from "./arch.js";
+export * as model from "./model/index.js";
+export type {
+  ActivationFn,
+  Layer,
+  LayerParam,
+  WeightMap,
+  LayerConfig,
+  DenseConfig,
+  Conv2DConfig,
+  FlattenConfig,
+  DepthwiseConv2DConfig,
+  SeparableConv2DConfig,
+  MaxPooling2DConfig,
+  GlobalAveragePooling2DConfig,
+  ZeroPadding2DConfig,
+  BatchNormalizationConfig,
+} from "./model/index.js";
+export {
+  Dense,
+  Flatten,
+  Conv2D,
+  Sequential,
+  DepthwiseConv2D,
+  SeparableConv2D,
+  MaxPooling2D,
+  GlobalAveragePooling2D,
+  ZeroPadding2D,
+  BatchNormalization,
+} from "./model/index.js";
+export type { LossFn, TrainStepResult } from "./model/index.js";
+
+// ── Optimizers namespace ────────────────────────────────────────────────────
+export * as optimizers from "./optimizers/index.js";
+export type { ParamSpec } from "./optimizers/index.js";
+
 // ── InferencePool ─────────────────────────────────────────────────────────────
 export type {
   PoolOptions,
@@ -121,14 +177,3 @@ export type {
   ExecutionStrategy,
 } from "./inference-pool.js";
 export { InferencePool } from "./inference-pool.js";
-
-// ── Model layers and optimizers ───────────────────────────────────────────────
-export * as optimizers from "./optimizers/index.js";
-export type {
-  ActivationFn,
-  Layer,
-  LayerParam,
-  LossFn,
-  TrainStepResult,
-} from "./model/index.js";
-export { Dense, Flatten, Conv2D, Sequential } from "./model/index.js";

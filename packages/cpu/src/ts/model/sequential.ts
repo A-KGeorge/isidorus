@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { toonEncode, toonDecode } from "../toon.js";
 import type { Tensor } from "@isidorus/core";
 import { DType } from "@isidorus/core";
 import { Graph } from "../graph.js";
@@ -100,6 +101,7 @@ export class Sequential {
   private _loss!: string;
   private _extraUpdateOps!: string[]; // EMA ops from BN layers
   private _nonTrainable!: LayerParam[]; // moving_mean/var — saved but not trained
+  private _hasBatchNorm!: boolean; // true if any layer is BatchNormalization
   private compiled = false;
 
   constructor(g: Graph, layers: Layer[]) {
@@ -254,6 +256,9 @@ export class Sequential {
     this._nonTrainable = this.layers.flatMap(
       (l) => l.nonTrainableParams?.() ?? [],
     );
+    this._hasBatchNorm = this.layers.some(
+      (l) => l instanceof BatchNormalization,
+    );
     this._allParams = allLayerParams.map((p, i) => ({
       handle: p.handle,
       grad: grads[i],
@@ -404,6 +409,14 @@ export class Sequential {
    *
    * Uses runAsync() so the event loop stays free during inference.
    * For Worker threads where blocking is acceptable, call sess.run() directly.
+   *
+   * ⚠ BatchNormalization warning:
+   *   This model contains BatchNormalization layers. predict() runs the training
+   *   graph which uses *batch statistics*, not the learned moving_mean/moving_var.
+   *   For correct inference results, use exportFrozen() → InferencePool instead:
+   *
+   *     model.exportFrozen(sess, "model.pb");
+   *     const pool = await InferencePool.create({ modelPath: "model.pb" });
    */
   async predict(
     sess: Session,
@@ -411,6 +424,13 @@ export class Sequential {
     xShape: number[],
   ): Promise<{ data: Buffer; shape: number[]; dtype: DType }> {
     this.assertCompiled("predict");
+    if (this._hasBatchNorm) {
+      process.emitWarning(
+        "Sequential.predict() uses batch statistics for BatchNormalization layers. " +
+          "For correct inference use exportFrozen() → InferencePool.",
+        { code: "ISIDORUS_BN_PREDICT" },
+      );
+    }
     const [out] = await sess.runAsync(
       [
         [
@@ -549,11 +569,9 @@ export class Sequential {
       params,
     };
 
-    writeFileSync(
-      join(dir, "manifest.json"),
-      JSON.stringify(manifest, null, 2),
-      "utf8",
-    );
+    // TOON encodes the manifest as a compact binary — faster to parse than JSON,
+    // no repeated key strings, integers stored as 4-byte LE rather than decimal text.
+    writeFileSync(join(dir, "manifest.toon"), toonEncode(manifest));
     writeFileSync(join(dir, "weights.bin"), Buffer.concat(parts));
   }
 
@@ -569,9 +587,8 @@ export class Sequential {
   loadWeights(sess: Session, dir: string): void {
     this.assertCompiled("loadWeights");
 
-    const manifest = JSON.parse(
-      readFileSync(join(dir, "manifest.json"), "utf8"),
-    ) as {
+    const manifestBuf = readFileSync(join(dir, "manifest.toon"));
+    const manifest = toonDecode(manifestBuf) as {
       version: number;
       inputShape: number[];
       params: {
@@ -765,11 +782,8 @@ export class Sequential {
       params,
     };
 
-    writeFileSync(
-      join(dir, "model.json"),
-      JSON.stringify(modelJson, null, 2),
-      "utf8",
-    );
+    // TOON for architecture + manifest — faster parse, more compact than JSON.
+    writeFileSync(join(dir, "model.toon"), toonEncode(modelJson));
     writeFileSync(join(dir, "weights.bin"), Buffer.concat(parts));
   }
 
@@ -791,7 +805,7 @@ export class Sequential {
    * @returns    { model: Sequential, g: Graph }
    */
   static loadModel(dir: string): { model: Sequential; g: Graph } {
-    const raw = JSON.parse(readFileSync(join(dir, "model.json"), "utf8")) as {
+    const raw = toonDecode(readFileSync(join(dir, "model.toon"))) as {
       version: number;
       loss: string;
       inputShape: number[];
