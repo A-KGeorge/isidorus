@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.7
+
+### Patch Changes
+
+- 28e43dc: Add fix for input shape
+
 ## 0.0.0-alpha.6
 
 ### Patch Changes
