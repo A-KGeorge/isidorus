@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.8
+
+### Patch Changes
+
+- b0500c6: Added abstraction + toon support
+
 ## 0.0.0-alpha.7
 
 ### Patch Changes
