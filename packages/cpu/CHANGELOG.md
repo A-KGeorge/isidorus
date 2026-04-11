@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.9
+
+### Patch Changes
+
+- 0004c81: Added libtensorflow postinstall
+
 ## 0.0.0-alpha.8
 
 ### Patch Changes
