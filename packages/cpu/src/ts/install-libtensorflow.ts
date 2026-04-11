@@ -129,6 +129,18 @@ export async function ensureTf(): Promise<string> {
   const resolved = await resolveTfPath();
   if (resolved) {
     process.env["LIBTENSORFLOW_PATH"] = resolved.tfPath;
+
+    // Inject the lib folder into the current process PATH on Windows so
+    // the OS loader can find tensorflow.dll when the .node addon is required.
+    // This avoids requiring the user to restart their terminal after install.
+    if (platform() === "win32") {
+      const libDir = join(resolved.tfPath, "lib");
+      const currentPath = process.env.PATH || "";
+      if (!currentPath.toLowerCase().includes(libDir.toLowerCase())) {
+        process.env.PATH = `${libDir};${currentPath}`;
+      }
+    }
+
     return resolved.tfPath;
   }
 

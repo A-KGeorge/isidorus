@@ -92,35 +92,9 @@ function getPlatformSpec() {
       extractCmd: (src, dst) =>
         `powershell -NoProfile -Command "Expand-Archive -Path '${src}' -DestinationPath '${dst}' -Force"`,
       postExtract: async () => {
-        // Add libtf\lib to the user PATH so tensorflow.dll is found by the OS
-        // loader. setx writes to HKCU — no admin required. Takes effect in new
-        // shells; existing processes need to restart.
-        const libDir = join(LIBTF_DIR, "lib");
-        try {
-          // Read current user PATH to avoid duplicates.
-          const { stdout: cur } = await execAsync(
-            `powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('PATH','User')"`,
-          );
-          const curPath = (cur || "").trim();
-          if (!curPath.toLowerCase().includes(libDir.toLowerCase())) {
-            const newPath = curPath ? `${curPath};${libDir}` : libDir;
-            await execAsync(
-              `powershell -NoProfile -Command ` +
-                `"[Environment]::SetEnvironmentVariable('PATH','${newPath}','User')"`,
-            );
-            console.log(`  [isidorus] Added ${libDir} to user PATH.`);
-            console.log(
-              `  [isidorus] Restart your terminal for PATH to take effect.`,
-            );
-          }
-        } catch (e) {
-          console.warn(
-            `  [isidorus] Could not update PATH automatically: ${e.message}`,
-          );
-          console.warn(
-            `  [isidorus] Add this directory to PATH manually: ${libDir}`,
-          );
-        }
+        // No permanent PATH modifications required.
+        // install-libtensorflow.ts handles injecting the path into process.env.PATH
+        // at runtime to resolve tensorflow.dll without requiring a terminal restart.
       },
       winPath: join(LIBTF_DIR, "lib"),
     };
