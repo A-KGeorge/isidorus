@@ -25,7 +25,7 @@ import { graph, session, ops, DType } from "@isidorus/cpu";
 const g = graph();
 const x = ops.placeholder(g, "x", [null, 784], DType.FLOAT32);
 
-const sess = session(g, { strategy: "tf-parallel", reserveCores: 2 });
+const sess = session(g, { reserveCores: 2 });
 ```
 
 ## Development

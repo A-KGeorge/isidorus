@@ -105,23 +105,7 @@ describe("InferencePool Integration", () => {
   });
 
   /**
-   * Test 3: Auto Strategy Selection
-   * Verifies the model-size based switching logic.
-   */
-  it("should select tf-parallel for bench_small.pb", async () => {
-    const pool = await InferencePool.create({
-      modelPath: MODEL_PATH,
-    });
-
-    try {
-      assert.strictEqual(pool.strategy, "tf-parallel");
-    } finally {
-      await pool.destroy();
-    }
-  });
-
-  /**
-   * Test 4: Auto-discovery of inputOp and outputOps.
+   * Test 3: Auto-discovery of inputOp and outputOps.
    * When omitted from PoolOptions, create() should infer them from the graph.
    */
   it("should auto-discover inputOp and outputOps when not specified", async () => {
@@ -140,7 +124,7 @@ describe("InferencePool Integration", () => {
   });
 
   /**
-   * Test 5: Output data is always a proper Buffer.
+   * Test 4: Output data is always a proper Buffer.
    * Verifies the structured-clone fix — postMessage converts Buffer to
    * Uint8Array across the worker boundary; InferencePool must wrap it back.
    */
@@ -167,7 +151,7 @@ describe("InferencePool Integration", () => {
   });
 
   /**
-   * Test 6: destroy() cleans up even when no inference has run.
+   * Test 5: destroy() cleans up even when no inference has run.
    */
   it("should destroy cleanly without any inference calls", async () => {
     const pool = await InferencePool.create({
@@ -179,7 +163,7 @@ describe("InferencePool Integration", () => {
   });
 
   /**
-   * Test 7: Multiple sequential inferences on the same pool.
+   * Test 6: Multiple sequential inferences on the same pool.
    */
   it("should handle multiple sequential inferences", async () => {
     const pool = await InferencePool.create({

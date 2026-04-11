@@ -309,10 +309,9 @@ Napi::Object SessionWrap::Init(Napi::Env env, Napi::Object exports)
 // ---------------------------------------------------------------------------
 // Constructor
 //
-// Options:
-//   strategy?:        "worker-pool" | "tf-parallel"
-//   intraOpThreads?:  number  (overrides strategy default)
-//   interOpThreads?:  number  (overrides strategy default)
+/// Options:
+//   intraOpThreads?:  number  (threads per op; default = hardware_concurrency())
+//   interOpThreads?:  number  (concurrent independent graph branches; default = 1)
 //   reserveCores?:    number  (reserve first N cores for event loop / other libs)
 //
 // CPU affinity model:
@@ -365,21 +364,13 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo &info)
     {
         auto opts = info[1].As<Napi::Object>();
 
-        // Strategy sets thread count defaults.
-        if (opts.Has("strategy"))
+        // Default intra_op to all hardware threads when no explicit value given.
         {
-            std::string strat = opts.Get("strategy")
-                                    .As<Napi::String>()
-                                    .Utf8Value();
-            if (strat == "tf-parallel")
-            {
-                unsigned hw = std::thread::hardware_concurrency();
-                intra_op = hw > 0 ? static_cast<int>(hw) : 4;
-                inter_op = 1;
-            }
+            unsigned hw = std::thread::hardware_concurrency();
+            intra_op = hw > 0 ? static_cast<int>(hw) : 4;
         }
 
-        // Explicit values always override strategy defaults.
+        // Explicit values override the default.
         if (opts.Has("intraOpThreads"))
             intra_op = opts.Get("intraOpThreads").As<Napi::Number>().Int32Value();
         if (opts.Has("interOpThreads"))

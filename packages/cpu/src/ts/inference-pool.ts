@@ -1,16 +1,15 @@
 /**
- * InferencePool — tf-parallel only.
+ * InferencePool — concurrent TF inference via a single session and async queue.
  *
- * Architecture decision (backed by benchmarks):
+ * Architecture:
+ *   A single TF session handles all concurrent requests. TF's internal thread
+ *   scheduler (intra/interOpThreads) handles CPU parallelism — it knows which
+ *   ops can run in parallel and avoids false sharing across cores. An async JS
+ *   queue manages concurrent callers; maxQueueDepth provides backpressure.
  *
- *   Worker-pool was removed. The Atomics-based state machine introduced
- *   mutex-like coordination that produced p99 spikes under concurrency >= 4.
- *   TF's internal thread scheduler (intra/interOpThreads) is more efficient
- *   at CPU parallelism than a Node-level worker pool — it knows which ops can
- *   run in parallel and avoids false sharing.
- *
- *   tf-parallel: single TF session, async JS queue for concurrent callers.
- *   TF handles threading internally. Queue limits concurrency via maxQueueDepth.
+ *   The autotuner benchmarks candidate intra/inter/concurrency configs during
+ *   create() and selects the best for this model on this machine (~300ms cold
+ *   start). Override with explicit intraOpThreads/maxConcurrent to skip it.
  *
  * Benchmark results (AMD Ryzen 9 5900X, 24 threads):
  *   bench_small (MobileNetV2, 224x224x3):  1.36-3.5x faster than tfjs-node
@@ -30,8 +29,6 @@ import { DType } from "@isidorus/core";
 import type { TensorValue, FeedValue } from "./session.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
-
-export type ExecutionStrategy = "tf-parallel";
 
 /**
  * Optimisation profile — controls how InferencePool chooses thread counts
@@ -144,8 +141,6 @@ interface QueueEntry {
 // ── InferencePool ─────────────────────────────────────────────────────────────
 
 export class InferencePool {
-  readonly strategy: ExecutionStrategy = "tf-parallel";
-
   private readonly graph: Graph;
   private readonly sess: Session;
   private readonly inputOp: string;
@@ -259,7 +254,6 @@ export class InferencePool {
     const makeSession = (intra: number, inter: number) =>
       new Session(
         new addon.Session(g._native, {
-          strategy: "tf-parallel",
           reserveCores,
           intraOpThreads: intra,
           interOpThreads: inter,

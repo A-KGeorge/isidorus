@@ -90,19 +90,17 @@ export function graph(): Graph {
  *
  * @param g        The graph to execute.
  * @param options  Thread and affinity configuration:
- *   strategy?:       "worker-pool" | "tf-parallel"
  *   intraOpThreads?: number   (explicit override)
  *   interOpThreads?: number
  *   reserveCores?:   number   (reserve N cores for event loop / other libs)
  *
  * @example
  * // Leave 2 cores for the event loop and opencv — TF gets the rest
- * const sess = session(g, { strategy: "tf-parallel", reserveCores: 2 });
+ * const sess = session(g, { reserveCores: 2 });
  */
 export function session(
   g: Graph,
   options?: {
-    strategy?: "worker-pool" | "tf-parallel";
     intraOpThreads?: number;
     interOpThreads?: number;
     reserveCores?: number;
@@ -171,9 +169,5 @@ export * as optimizers from "./optimizers/index.js";
 export type { ParamSpec } from "./optimizers/index.js";
 
 // ── InferencePool ─────────────────────────────────────────────────────────────
-export type {
-  PoolOptions,
-  PoolResult,
-  ExecutionStrategy,
-} from "./inference-pool.js";
+export type { PoolOptions, PoolResult } from "./inference-pool.js";
 export { InferencePool } from "./inference-pool.js";

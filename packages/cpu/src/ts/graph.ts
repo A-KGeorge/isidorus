@@ -195,7 +195,7 @@ export class Graph {
    * import { readFileSync } from "fs";
    * const g = graph();
    * g.importGraphDef(readFileSync("model.pb"));
-   * const sess = session(g, { strategy: "tf-parallel", reserveCores: 2 });
+   * const sess = session(g, { reserveCores: 2 });
    */
   importGraphDef(buffer: Buffer): void {
     this._native.importGraphDef(buffer);
