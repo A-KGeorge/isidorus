@@ -1,6 +1,6 @@
 {
     "name": "@isidorus/cpu",
-    "version": "0.0.0-alpha.8",
+    "version": "0.0.0-alpha.9",
     "description": "Tensorflow CPU graph construction, training, and inference for Node.js",
     "type": "module",
     "main": "./dist/index.js",
@@ -30,7 +30,6 @@
         "build": "npm run build:ts && npm run build:native",
         "prebuildify": "prebuildify --napi --strip --target 18.0.0 --target 20.0.0 --target 22.0.0 --target 24.0.0",
         "postinstall": "node scripts/postinstall.mjs"
-
     },
     "binary": {
         "napi_versions": [
