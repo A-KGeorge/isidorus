@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.10
+
+### Patch Changes
+
+- e99809e: Fix postinstall
+
 ## 0.0.0-alpha.9
 
 ### Patch Changes
