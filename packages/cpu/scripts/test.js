@@ -23,6 +23,11 @@ const args = [
 ];
 
 const env = { ...process.env };
+
+// Suppress TensorFlow startup messages (oneDNN, CPU features, MLIR optimization).
+// Level 2 filters out INFO and WARNING; set TF_CPP_MIN_LOG_LEVEL=0 to restore.
+env.TF_CPP_MIN_LOG_LEVEL = "3";
+
 if (process.platform === "win32") {
   const libtfPath = env.LIBTENSORFLOW_PATH || "C:\\libtensorflow";
   const dllDir = libtfPath.toLowerCase().endsWith("\\lib")

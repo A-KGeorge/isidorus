@@ -27,6 +27,8 @@ import { Session } from "./session.js";
 import { debug, warn } from "./_log.js";
 import { DType } from "@isidorus/core";
 import type { TensorValue, FeedValue } from "./session.js";
+import type { DataLike } from "./model/easy.js";
+import { toFloat32Array, toInt32Array } from "./model/easy.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -131,7 +133,7 @@ const AUTOTUNE_LATENCY_PREFERENCE_MARGIN = 0.08; // 8%
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 interface QueueEntry {
-  inputBuf: Buffer;
+  inputData: Float32Array | Int32Array;
   inputShape: number[];
   inputDtype: number;
   resolve: (r: PoolResult) => void;
@@ -501,42 +503,78 @@ export class InferencePool {
    * Runs immediately if the session is idle. Otherwise queues the request
    * (FIFO). Throws QueueFullError synchronously if maxQueueDepth is reached.
    *
-   * @param inputBuf   Raw tensor bytes
+   * Accepts data in multiple formats:
+   * - Float32Array / Int32Array (fastest, zero-copy)
+   * - JS arrays: [1, 2, 3, ...] or nested [[1, 2, ...], ...] (auto-flattened)
+   *
+   * @param inputData  Input tensor data (array or typed array)
    * @param inputShape [batchSize, ...dims]
-   * @param inputDtype TF DType integer (1=FLOAT32, 3=INT32, ...)
+   * @param inputDtype TF DType integer (1=FLOAT32, 3=INT32, ...). Default: 1 (FLOAT32).
    */
   infer(
-    inputBuf: Buffer,
+    inputData: DataLike,
     inputShape: number[],
     inputDtype: number = 1, // TF_FLOAT
   ): Promise<PoolResult> {
     if (this.destroyed)
       return Promise.reject(new Error("InferencePool has been destroyed"));
 
+    // Convert input data to a typed array
+    let inputTyped: Float32Array | Int32Array;
+    try {
+      if (inputDtype === 3) {
+        // INT32
+        inputTyped = toInt32Array(inputData);
+      } else {
+        // Default to FLOAT32
+        inputTyped = toFloat32Array(inputData);
+      }
+    } catch (e) {
+      return Promise.reject(
+        new Error(
+          `infer() data conversion failed: ${(e as Error).message}. ` +
+            `Expected data matching shape ${JSON.stringify(inputShape)}.`,
+        ),
+      );
+    }
+
     // Dispatch immediately if a concurrent slot is available.
     // Multiple runAsync() calls on the same session are safe — TF's inter-op
     // scheduler overlaps independent ops across concurrent requests, which
     // is how tfjs-node achieves sub-linear latency scaling at high concurrency.
     if (this.active < this.maxConcurrent)
-      return this._run(inputBuf, inputShape, inputDtype);
+      return this._run(inputTyped, inputShape, inputDtype);
 
     // All slots occupied — queue the request.
     if (this.queue.length >= this.maxQueueDepth)
       throw new QueueFullError(this.queue.length);
 
     return new Promise<PoolResult>((resolve, reject) => {
-      this.queue.push({ inputBuf, inputShape, inputDtype, resolve, reject });
+      this.queue.push({
+        inputData: inputTyped,
+        inputShape,
+        inputDtype,
+        resolve,
+        reject,
+      });
     });
   }
 
   private async _run(
-    inputBuf: Buffer,
+    inputTyped: Float32Array | Int32Array,
     inputShape: number[],
     inputDtype: number,
   ): Promise<PoolResult> {
     this.active++;
     const t0 = performance.now();
     try {
+      // Create a Buffer view of the typed array for TensorFlow
+      const inputBuf = Buffer.from(
+        inputTyped.buffer,
+        inputTyped.byteOffset,
+        inputTyped.byteLength,
+      );
+
       const feeds = [
         [
           { opName: this.inputOp, index: 0 },
@@ -561,7 +599,7 @@ export class InferencePool {
       !this.destroyed
     ) {
       const next = this.queue.shift()!;
-      this._run(next.inputBuf, next.inputShape, next.inputDtype).then(
+      this._run(next.inputData, next.inputShape, next.inputDtype).then(
         next.resolve,
         next.reject,
       );

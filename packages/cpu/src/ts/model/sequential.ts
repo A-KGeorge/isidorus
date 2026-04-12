@@ -102,6 +102,7 @@ export class Sequential {
   private _extraUpdateOps!: string[]; // EMA ops from BN layers
   private _nonTrainable!: LayerParam[]; // moving_mean/var — saved but not trained
   private _hasBatchNorm!: boolean; // true if any layer is BatchNormalization
+  private _outputShape!: (number | null)[]; // shape after last layer
   private compiled = false;
 
   constructor(g: Graph, layers: Layer[]) {
@@ -145,6 +146,7 @@ export class Sequential {
       current = layer.output;
     }
     this._outputTensor = current;
+    this._outputShape = shape;
 
     // ── Collect all layer params ──────────────────────────────────────────
     const allLayerParams = this.layers.flatMap((l) => l.layerParams);
@@ -461,6 +463,11 @@ export class Sequential {
   get output(): Tensor {
     this.assertCompiled("output");
     return this._outputTensor;
+  }
+
+  get outputShape(): (number | null)[] {
+    this.assertCompiled("outputShape");
+    return this._outputShape;
   }
 
   /** Scalar mean loss tensor — available after compile(). */

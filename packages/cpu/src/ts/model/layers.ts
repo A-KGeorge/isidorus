@@ -91,6 +91,7 @@ export class Dense implements Layer {
   private readonly units: number;
   private readonly activation: ActivationFn;
   private readonly useBias: boolean;
+  private inFeatures: number = 0; // Set during build()
 
   constructor(
     units: number,
@@ -112,6 +113,7 @@ export class Dense implements Layer {
     inputShape: (number | null)[],
   ): (number | null)[] {
     const inFeatures = inputShape[inputShape.length - 1] as number;
+    this.inFeatures = inFeatures; // Store for paramCount()
     if (!inFeatures || inFeatures < 1)
       throw new Error(
         `Dense "${
@@ -225,6 +227,13 @@ export class Dense implements Layer {
       useBias: this.useBias,
     };
   }
+
+  paramCount(): number {
+    // Weight matrix: [inFeatures, units] + bias: [units]
+    let count = this.inFeatures * this.units;
+    if (this.useBias) count += this.units;
+    return count;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +331,7 @@ export class Conv2D implements Layer {
   private readonly padding: "SAME" | "VALID";
   private readonly activation: ActivationFn;
   private readonly useBias: boolean;
+  private inChannels: number = 0; // Set during build()
 
   constructor(
     filters: number,
@@ -359,6 +369,7 @@ export class Conv2D implements Layer {
       );
 
     const inChannels = inputShape[3] as number;
+    this.inChannels = inChannels; // Store for paramCount()
     if (!inChannels || inChannels < 1)
       throw new Error(
         `Conv2D "${this.name}": in_channels must be known, got ${JSON.stringify(
@@ -526,6 +537,14 @@ export class Conv2D implements Layer {
       activation: this.activation,
       useBias: this.useBias,
     };
+  }
+
+  paramCount(): number {
+    // Kernel: [kH, kW, inChannels, filters] + bias: [filters]
+    const [kH, kW] = this.kernelSize;
+    let count = kH * kW * this.inChannels * this.filters;
+    if (this.useBias) count += this.filters;
+    return count;
   }
 }
 

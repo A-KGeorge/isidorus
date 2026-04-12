@@ -11,6 +11,15 @@ import nodeGypBuild from "node-gyp-build";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
+// ── Suppress TensorFlow logging unless explicitly enabled ────────────────────
+// Prevents noisy startup messages from libtensorflow (oneDNN, CPU features, etc.).
+// Users can override by setting TF_CPP_MIN_LOG_LEVEL before importing @isidorus/cpu:
+//   process.env.TF_CPP_MIN_LOG_LEVEL = "0";
+//   import "@isidorus/cpu";
+if (!process.env["TF_CPP_MIN_LOG_LEVEL"]) {
+  process.env["TF_CPP_MIN_LOG_LEVEL"] = "3"; // Suppress INFO, WARNING, ERROR
+}
+
 // ── Ensure libtensorflow is present before touching the native addon ─────────
 // This is the only await at module top level — it resolves synchronously
 // on the fast path (library already present) and only blocks for the
@@ -149,6 +158,7 @@ export type {
   GlobalAveragePooling2DConfig,
   ZeroPadding2DConfig,
   BatchNormalizationConfig,
+  OptimizerName,
 } from "./model/index.js";
 export {
   Dense,
@@ -161,11 +171,23 @@ export {
   GlobalAveragePooling2D,
   ZeroPadding2D,
   BatchNormalization,
+  Model,
+  ConvBnRelu,
+  ConvBnRelu6,
+  InvertedResidual,
+  ResidualBlock,
+} from "./model/index.js";
+export type {
+  CompileOptions,
+  FitOptions,
+  EpochLogs,
+  FitResult,
 } from "./model/index.js";
 export type { LossFn, TrainStepResult } from "./model/index.js";
 
 // ── Optimizers namespace ────────────────────────────────────────────────────
 export * as optimizers from "./optimizers/index.js";
+export { SGD, Adam, RMSProp } from "./optimizers/index.js";
 export type { ParamSpec } from "./optimizers/index.js";
 
 // ── InferencePool ─────────────────────────────────────────────────────────────

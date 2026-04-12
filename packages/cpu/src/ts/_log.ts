@@ -14,8 +14,8 @@
 const DEBUG = process.env["ISIDORUS_DEBUG"] === "1";
 
 /** Prints to stderr only when ISIDORUS_DEBUG=1. */
-export function debug(msg: string): void {
-  if (DEBUG) process.stderr.write(`[isidorus] ${msg}\n`);
+export function debug(...msgs: unknown[]): void {
+  if (DEBUG) process.stderr.write(`[isidorus] ${msgs.join(" ")}\n`);
 }
 
 /** Always prints to stderr — for actionable warnings. */

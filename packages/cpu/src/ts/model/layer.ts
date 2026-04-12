@@ -197,4 +197,11 @@ export interface Layer {
    * from model.params and therefore have no gradients.
    */
   nonTrainableParams?(): LayerParam[];
+
+  /**
+   * Optional: return the number of trainable parameters in this layer.
+   * Used by Model.countParams() for parameter counting.
+   * If not implemented, defaults to 0.
+   */
+  paramCount?(): number;
 }

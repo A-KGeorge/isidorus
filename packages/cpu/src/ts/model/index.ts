@@ -27,3 +27,23 @@ export {
 } from "./layers.js";
 export type { LossFn, TrainStepResult } from "./sequential.js";
 export { Sequential } from "./sequential.js";
+export type { OptimizerName, DataLike } from "./easy.js";
+export type {
+  CompileOptions,
+  FitOptions,
+  EpochLogs,
+  FitResult,
+} from "./easy.js";
+export {
+  Model,
+  toFloat32Array,
+  toInt32Array,
+  mobilenetv2,
+  resnet50,
+} from "./easy.js";
+export {
+  ConvBnRelu,
+  ConvBnRelu6,
+  InvertedResidual,
+  ResidualBlock,
+} from "./easy-layers.js";
