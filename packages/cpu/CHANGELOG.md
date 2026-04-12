@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.11
+
+### Patch Changes
+
+- 714f00f: Added api abstraction
+
 ## 0.0.0-alpha.10
 
 ### Patch Changes
