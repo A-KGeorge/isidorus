@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.13
+
+### Patch Changes
+
+- 3b643b2: Fix post-install for linux/darwin
+
 ## 0.0.0-alpha.12
 
 ### Patch Changes
