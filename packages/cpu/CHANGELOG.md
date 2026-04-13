@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.16
+
+### Patch Changes
+
+- ea86abc: removed jude-map dependency
+
 ## 0.0.0-alpha.15
 
 ### Patch Changes
