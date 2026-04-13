@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.14
+
+### Patch Changes
+
+- 7367426: Corrected implementations for pre-build model factories
+
 ## 0.0.0-alpha.13
 
 ### Patch Changes
