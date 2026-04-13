@@ -958,7 +958,12 @@ import {
   GlobalAveragePooling2D,
   MaxPooling2D,
 } from "./layers.js";
-import { InvertedResidual, ResidualBlock } from "./easy-layers.js";
+import {
+  ConvBnRelu,
+  ConvBnRelu6,
+  InvertedResidual,
+  ResidualBlock,
+} from "./easy-layers.js";
 
 /**
  * MobileNetV2 pre-built model.
@@ -988,13 +993,11 @@ export function mobilenetv2(
   classes: number = 1000,
 ): Model {
   const layers: Layer[] = [
-    // Initial convolution: 224×224×3 → 112×112×32 (stride=2)
-    new Conv2D(32, {
-      kernelSize: 3,
-      strides: 2,
+    // Initial convolution with BN + ReLU6: 224×224×3 → 112×112×32 (stride=2)
+    // MobileNetV2 uses ReLU6 everywhere for better quantization
+    new ConvBnRelu6(32, 3, {
+      stride: 2,
       padding: "SAME",
-      useBias: false,
-      activation: "linear",
       name: "conv_stem",
     }),
 
@@ -1098,14 +1101,10 @@ export function mobilenetv2(
       name: "ir7",
     }),
 
-    // Classification head
-    new Conv2D(1280, {
-      kernelSize: 1,
-      padding: "SAME",
-      useBias: false,
-      activation: "linear",
-      name: "conv_head",
-    }),
+    // Classification head: Conv1280 → BN → ReLU6 → GlobalAvgPool → Dense
+    // Using ConvBnRelu6 for strict paper compliance (some variants omit final ReLU6,
+    // but TensorFlow/Keras includes it for better training dynamics)
+    new ConvBnRelu6(1280, 1, { name: "conv_head" }),
     new GlobalAveragePooling2D(),
     new Dense(classes, { name: "predictions" }),
   ];
@@ -1150,12 +1149,10 @@ export function resnet50(
   const layers: Layer[] = [
     // ── Initial convolution + pooling ────────────────────────────────────
     // 224×224×3 → 112×112×64 → 56×56×64
-    new Conv2D(64, {
-      kernelSize: 7,
-      strides: 2,
+    // Per original ResNet paper: Conv → BN → ReLU → MaxPool
+    new ConvBnRelu(64, 7, {
+      stride: 2,
       padding: "SAME",
-      useBias: false,
-      activation: "linear",
       name: "conv1",
     }),
     new MaxPooling2D({
