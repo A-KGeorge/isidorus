@@ -32,6 +32,9 @@ import {
   writeFileSync,
   readdirSync,
   copyFileSync,
+  renameSync,
+  symlinkSync,
+  unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -134,19 +137,20 @@ function shouldSkip(spec) {
   return false;
 }
 
-// ── Library copying ───────────────────────────────────────────────────────────
+// ── Library relocation ────────────────────────────────────────────────────────
 
 /**
- * Copy shared libraries to prebuilds/{platform}-{arch} so the prebuilt .node
- * file can find them via RPATH ($ORIGIN on Linux, @loader_path on macOS).
+ * Move shared libraries to prebuilds/{platform}-{arch} to avoid duplication
+ * and let the prebuilt .node file find them via RPATH ($ORIGIN on Linux,
+ * @loader_path on macOS).
  *
- * This is especially important on Linux where the .node file's RUNPATH includes
- * $ORIGIN, allowing the dynamic linker to find libtensorflow.so without modifying
- * LD_LIBRARY_PATH or PATH.
+ * For source-based compilation compatibility, create symlinks back from
+ * libtf/lib/ to prebuilds/, so tools that expect libraries in libtf/lib
+ * can still find them.
  *
  * On Windows, this is not needed since the DLL is found via PATH.
  */
-function copyLibrariesToPrebuilds(spec) {
+function moveLibrariesToPrebuilds(spec) {
   const os = platform();
   if (os === "win32") {
     return; // Windows uses PATH, not needed
@@ -154,7 +158,7 @@ function copyLibrariesToPrebuilds(spec) {
 
   const libDir = join(LIBTF_DIR, "lib");
   if (!existsSync(libDir)) {
-    return; // Nothing to copy if lib dir doesn't exist
+    return; // Nothing to move if lib dir doesn't exist
   }
 
   let libFilePatterns = [];
@@ -176,7 +180,7 @@ function copyLibrariesToPrebuilds(spec) {
 
   try {
     const files = readdirSync(libDir);
-    let copiedCount = 0;
+    let movedCount = 0;
 
     for (const file of files) {
       // Match files ending with our library extensions
@@ -186,24 +190,43 @@ function copyLibrariesToPrebuilds(spec) {
       ) {
         const src = join(libDir, file);
         const dst = join(prebuildsDir, file);
+        const symlink = join(libDir, file);
+
         try {
-          copyFileSync(src, dst);
-          copiedCount++;
+          // Move file to prebuilds
+          renameSync(src, dst);
+
+          // Create symlink back for source compilation compatibility
+          try {
+            // Remove any existing symlink/file first
+            if (existsSync(symlink)) {
+              unlinkSync(symlink);
+            }
+            // Create relative symlink: libtf/lib/libtensorflow.so -> ../../../prebuilds/linux-x64/libtensorflow.so
+            const relPath = join("..", "..", "prebuilds", platformStr, file);
+            symlinkSync(relPath, symlink);
+          } catch (e) {
+            // Symlink creation failed (might be Windows-like filesystem)
+            // Non-fatal — the important thing is the file is in prebuilds
+            console.warn(
+              `[isidorus] symlink warning for ${file}: ${e.message}`,
+            );
+          }
+
+          movedCount++;
         } catch (e) {
-          // Non-fatal — log but continue
-          console.warn(`[isidorus] failed to copy ${file}: ${e.message}`);
+          console.warn(`[isidorus] failed to move ${file}: ${e.message}`);
         }
       }
     }
 
-    if (copiedCount > 0) {
+    if (movedCount > 0) {
       console.log(
-        `  Copied ${copiedCount} library files to prebuilds/${platformStr}/`,
+        `  Moved ${movedCount} library files to prebuilds/${platformStr}/`,
       );
     }
   } catch (e) {
-    // Non-fatal — prebuilt might already have them or user is using RPATH
-    console.warn(`[isidorus] library copy warning: ${e.message}`);
+    console.warn(`[isidorus] library move warning: ${e.message}`);
   }
 }
 
@@ -312,8 +335,9 @@ async function main() {
   // Platform-specific post-install (ldconfig, PATH modification, etc.)
   await spec.postExtract();
 
-  // Copy shared libraries to prebuilds dir for RPATH lookup on Linux/macOS.
-  copyLibrariesToPrebuilds(spec);
+  // Move shared libraries to prebuilds dir to avoid duplication.
+  // Creates symlinks back to libtf/lib/ for source compilation compatibility.
+  moveLibrariesToPrebuilds(spec);
 
   // Write a config file so the runtime resolver can find TF even without
   // LIBTENSORFLOW_PATH being set in the environment.
