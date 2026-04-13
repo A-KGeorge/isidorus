@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.15
+
+### Patch Changes
+
+- af7b982: Fix postinstall
+
 ## 0.0.0-alpha.14
 
 ### Patch Changes
