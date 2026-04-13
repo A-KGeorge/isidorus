@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.12
+
+### Patch Changes
+
+- cc411ac: Added support for post-install
+
 ## 0.0.0-alpha.11
 
 ### Patch Changes
