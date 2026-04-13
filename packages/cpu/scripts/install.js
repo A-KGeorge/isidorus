@@ -97,4 +97,20 @@ if (isArm) {
   }
 }
 
+// Download TensorFlow C library
+console.log("\nDownloading TensorFlow C library...");
+try {
+  execSync(`node scripts/postinstall.mjs`, {
+    cwd: projectRoot,
+    stdio: "inherit",
+  });
+} catch (error) {
+  console.error("Warning: Failed to set up TensorFlow:");
+  console.error(error.message);
+  console.error(
+    "\nPlease ensure TensorFlow is available. Set LIBTENSORFLOW_PATH if installing manually.",
+  );
+  // Don't exit(1) here - let the module load fail with a clear error instead
+}
+
 console.log("Installation complete!\n");
