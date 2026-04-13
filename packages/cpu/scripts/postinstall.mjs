@@ -171,9 +171,8 @@ function moveLibrariesToPrebuilds(spec) {
   }
 
   const cpu = arch();
-  const archStr = cpu === "arm64" ? "arm64" : "x86_64";
-  const platformStr =
-    os === "darwin" ? `darwin-${archStr}` : `linux-${archStr}`;
+  // Use Node.js arch naming for prebuilds directory (x64, not x86_64)
+  const platformStr = os === "darwin" ? `darwin-${cpu}` : `linux-${cpu}`;
   const prebuildsDir = join(PACKAGE_DIR, "prebuilds", platformStr);
 
   mkdirSync(prebuildsDir, { recursive: true });
