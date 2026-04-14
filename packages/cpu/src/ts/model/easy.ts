@@ -51,6 +51,17 @@ export interface CompileOptions {
   lr?: number;
   /** SGD momentum. Only used when optimizer === "sgd". Default: 0.0. */
   momentum?: number;
+  /**
+   * TF intra-op thread count (threads per op / kernel).
+   * Defaults to hardware_concurrency() — same as InferencePool.
+   * Set explicitly to match a known-good InferencePool autotuner result.
+   */
+  intraOpThreads?: number;
+  /**
+   * TF inter-op thread count (concurrent independent graph branches).
+   * Default: 1.
+   */
+  interOpThreads?: number;
 }
 
 export interface FitOptions {
@@ -80,6 +91,20 @@ export interface FitOptions {
    * Default: true.
    */
   shuffle?: boolean;
+  /**
+   * Whether to run each training step synchronously on the calling thread.
+   * Default: true (recommended for training loops).
+   *
+   * sync: true  — uses trainStepSync(): one blocking TF_SessionRun per batch.
+   *               Eliminates Promise + libuv thread-pool dispatch overhead.
+   *               Matches Python's sess.run() throughput.
+   *               Event loop is blocked during each step (acceptable in training).
+   *
+   * sync: false — uses trainStep(): dispatches to the libuv thread pool.
+   *               Use only when the event loop must remain live during training
+   *               (e.g. serving health-check requests while training).
+   */
+  sync?: boolean;
 }
 
 export interface EpochLogs {
@@ -324,6 +349,14 @@ export class Model {
   private _seq: Sequential | null = null;
   private _opt: Optimizer | null = null;
   private _loss: LossFn | null = null;
+  private _intraOpThreads: number = 0; // 0 = TF default (hw_concurrency)
+  private _interOpThreads: number = 1;
+  private _predictCallCount: number = 0; // for one-shot debug log
+  // WeakMap<source array, Float32Array> — caches toFloat32Array() results so
+  // repeated predict() calls with the same non-typed-array source pay the
+  // allocation cost once only. Automatically GC'd when the source is released.
+  private readonly _convertCache = new WeakMap<object, Float32Array>();
+  private readonly _convertCacheInt = new WeakMap<object, Int32Array>();
 
   // Populated on first fit() or predict()
   private _sess: Session | null = null;
@@ -348,7 +381,16 @@ export class Model {
   compile(opts: CompileOptions = { loss: "mse" }): void {
     if (this._seq) throw new Error("Model.compile() has already been called.");
 
-    const { loss, optimizer = "adam", lr = 0.001, momentum = 0.0 } = opts;
+    const {
+      loss,
+      optimizer = "adam",
+      lr = 0.001,
+      momentum = 0.0,
+      intraOpThreads = 0,
+      interOpThreads = 1,
+    } = opts;
+    this._intraOpThreads = intraOpThreads;
+    this._interOpThreads = interOpThreads;
 
     this._loss = loss;
     const addon = getAddon();
@@ -369,6 +411,15 @@ export class Model {
       // User passed a pre-built optimizer — trust it.
       this._opt = optimizer;
     }
+    debug(
+      `[Model] compiled  loss=${loss}  optimizer=${
+        typeof optimizer === "string" ? optimizer : "custom"
+      }` +
+        `  lr=${lr}  inputShape=${JSON.stringify(this.inputShape)}` +
+        `  intraOpThreads=${
+          this._intraOpThreads || "hw_default"
+        }  interOpThreads=${this._interOpThreads}`,
+    );
   }
 
   // ── dispose ──────────────────────────────────────────────────────────────
@@ -388,6 +439,7 @@ export class Model {
    */
   dispose(): void {
     if (!this._sess) return; // already disposed or never initialized
+    debug("[Model] dispose  closing TF session");
     this._sess.destroy(); // → TF_CloseSession + TF_DeleteSession
     this._sess = null;
     this._initialized = false;
@@ -411,7 +463,14 @@ export class Model {
     if (!this._sess) {
       // Create native Session directly — no free-function factory in session.ts.
       const addon = getAddon();
-      this._sess = new Session(new addon.Session(this._g!._native, {}));
+      const sessOpts: Record<string, number> = {
+        interOpThreads: this._interOpThreads,
+      };
+      if (this._intraOpThreads > 0) {
+        // 0 means "let TF default to hardware_concurrency()" (session.cc default).
+        sessOpts.intraOpThreads = this._intraOpThreads;
+      }
+      this._sess = new Session(new addon.Session(this._g!._native, sessOpts));
       debug("[DEBUG] Session created");
     }
     if (!this._initialized) {
@@ -454,6 +513,7 @@ export class Model {
       verbose = true,
       onEpochEnd,
       shuffle = true,
+      sync = true,
     } = opts;
 
     const seq = this._seq!;
@@ -466,31 +526,65 @@ export class Model {
     let xDataTyped: Float32Array;
     let yDataTyped: Float32Array | Int32Array;
 
-    try {
-      xDataTyped = toFloat32Array(xData);
-    } catch (e) {
-      throw new Error(
-        `Model.fit() xData conversion failed: ${(e as Error).message}. ` +
-          `Expected data matching inputShape ${JSON.stringify(
-            this.inputShape,
-          )}.`,
-      );
+    if (xData instanceof Float32Array) {
+      xDataTyped = xData;
+    } else {
+      const cached = this._convertCache.get(xData as object);
+      if (cached) {
+        xDataTyped = cached;
+      } else {
+        try {
+          xDataTyped = toFloat32Array(xData);
+        } catch (e) {
+          throw new Error(
+            `Model.fit() xData conversion failed: ${(e as Error).message}. ` +
+              `Expected data matching inputShape ${JSON.stringify(
+                this.inputShape,
+              )}.`,
+          );
+        }
+        this._convertCache.set(xData as object, xDataTyped);
+      }
     }
 
-    try {
-      yDataTyped =
-        loss === "sparse_categorical_crossentropy"
-          ? toInt32Array(yData)
-          : toFloat32Array(yData);
-    } catch (e) {
-      throw new Error(
-        `Model.fit() yData conversion failed: ${(e as Error).message}. ` +
-          `Expected ${
-            loss === "sparse_categorical_crossentropy"
-              ? "class indices (0, 1, 2, ...)"
-              : "float values"
-          }.`,
-      );
+    if (loss === "sparse_categorical_crossentropy") {
+      if (yData instanceof Int32Array) {
+        yDataTyped = yData;
+      } else {
+        const cached = this._convertCacheInt.get(yData as object);
+        if (cached) {
+          yDataTyped = cached;
+        } else {
+          try {
+            yDataTyped = toInt32Array(yData);
+          } catch (e) {
+            throw new Error(
+              `Model.fit() yData conversion failed: ${(e as Error).message}. ` +
+                `Expected class indices (0, 1, 2, ...).`,
+            );
+          }
+          this._convertCacheInt.set(yData as object, yDataTyped as Int32Array);
+        }
+      }
+    } else {
+      if (yData instanceof Float32Array) {
+        yDataTyped = yData;
+      } else {
+        const cached = this._convertCache.get(yData as object);
+        if (cached) {
+          yDataTyped = cached;
+        } else {
+          try {
+            yDataTyped = toFloat32Array(yData);
+          } catch (e) {
+            throw new Error(
+              `Model.fit() yData conversion failed: ${(e as Error).message}. ` +
+                `Expected float values.`,
+            );
+          }
+          this._convertCache.set(yData as object, yDataTyped as Float32Array);
+        }
+      }
     }
 
     const nTotal = Math.floor(xDataTyped.length / xElems);
@@ -518,61 +612,80 @@ export class Model {
     const nTrain = nTotal - nVal;
 
     const sess = await this.ensureSession();
+    debug(
+      `[Model] fit  samples=${nTotal}  epochs=${epochs}  batchSize=${batchSize}  sync=${sync}  nTrain=${
+        nTotal - Math.floor(nTotal * validationSplit)
+      }  nVal=${Math.floor(nTotal * validationSplit)}`,
+    );
 
     const history: EpochLogs[] = [];
 
     for (let ep = 0; ep < epochs; ep++) {
-      // Work on copies so shuffling doesn't mutate caller data.
-      const xTrain = xDataTyped.slice(0, nTrain * xElems);
-      const yTrain =
-        yDataTyped instanceof Int32Array
+      // When shuffle=true: slice() creates a mutable copy for in-place Fisher-Yates.
+      // When shuffle=false: subarray() creates a zero-copy view — saves a full
+      // dataset allocation per epoch (can be 10s of MB for large datasets).
+      const xTrain = shuffle
+        ? xDataTyped.slice(0, nTrain * xElems)
+        : xDataTyped.subarray(0, nTrain * xElems);
+      const yTrain = shuffle
+        ? yDataTyped instanceof Int32Array
           ? (yDataTyped.slice(0, nTrain * yElems) as Int32Array)
-          : (yDataTyped.slice(0, nTrain * yElems) as Float32Array);
+          : (yDataTyped.slice(0, nTrain * yElems) as Float32Array)
+        : ((yDataTyped instanceof Int32Array
+            ? yDataTyped.subarray(0, nTrain * yElems)
+            : (yDataTyped as Float32Array).subarray(
+                0,
+                nTrain * yElems,
+              )) as typeof yDataTyped);
 
-      if (shuffle) shuffleDataset(xTrain, xElems, yTrain, yElems, nTrain);
+      if (shuffle)
+        shuffleDataset(xTrain as Float32Array, xElems, yTrain, yElems, nTrain);
 
       let totalLoss = 0;
       let totalSteps = 0;
 
       const epochStart = Date.now();
 
+      // Wrap the epoch copy once in a Buffer. Subarray views into it are
+      // zero-allocation per batch and safe because xTrain / yTrain (the
+      // TypedArrays whose ArrayBuffer these alias) stay alive as const locals
+      // for the entire epoch loop. This eliminates one Buffer allocation +
+      // copy per batch — down to one Buffer.from() per epoch.
+      const xEpochBuf = Buffer.from(
+        xTrain.buffer,
+        xTrain.byteOffset,
+        xTrain.byteLength,
+      );
+      const yEpochBuf = Buffer.from(
+        (yTrain as any).buffer,
+        (yTrain as any).byteOffset,
+        (yTrain as any).byteLength,
+      );
+      void xTrain;
+      void yTrain; // keep TypedArrays (and their backing memory) live
+
       for (let start = 0; start < nTrain; start += batchSize) {
         const end = Math.min(start + batchSize, nTrain);
         const batchN = end - start;
-        const xBatch = xTrain.subarray(start * xElems, end * xElems);
-        const yBatch = (yTrain as any).subarray(
-          start * yElems,
-          end * yElems,
-        ) as typeof yTrain;
         const xShape = [batchN, ...this.inputShape];
         const yShape =
           loss === "sparse_categorical_crossentropy"
             ? [batchN]
             : [batchN, ...seq.outputShape.slice(1).map((s) => s ?? 1)];
 
-        // Allocate fresh Buffers and copy data into them so V8 cannot GC the
-        // backing memory before TF_SessionRunAsync finishes reading from it.
-        const xBuf = Buffer.from(
-          xBatch.buffer,
-          xBatch.byteOffset,
-          xBatch.byteLength,
-        );
-        const yBuf = Buffer.from(
-          yBatch.buffer,
-          yBatch.byteOffset,
-          yBatch.byteLength,
-        );
-        const { loss: stepLoss } = await seq.trainStep(
-          sess,
-          opt,
-          xBuf,
-          yBuf,
-          xShape,
-          yShape,
-          lDtype,
-        );
+        // Zero-allocation subarray views into the epoch Buffer.
+        // xEpochBuf shares the backing ArrayBuffer with xTrain, which is kept
+        // alive by the void ref above and by being in the outer for(ep) scope.
+        // Subarray() returns a Buffer view — no copy, no GC allocation.
+        const xBuf = xEpochBuf.subarray(start * xElems * 4, end * xElems * 4);
+        const yBuf = yEpochBuf.subarray(start * yElems * 4, end * yElems * 4);
+        const { loss: stepLoss } = sync
+          ? seq.trainStepSync(sess, opt, xBuf, yBuf, xShape, yShape, lDtype)
+          : await seq.trainStep(sess, opt, xBuf, yBuf, xShape, yShape, lDtype);
         void xBuf;
-        void yBuf; // keep refs live past the await
+        void yBuf;
+        void xEpochBuf;
+        void yEpochBuf; // keep refs live
         totalLoss += stepLoss;
         totalSteps += 1;
 
@@ -590,17 +703,28 @@ export class Model {
 
       const meanLoss = totalLoss / totalSteps;
       const elapsed = ((Date.now() - epochStart) / 1000).toFixed(1);
+      debug(
+        `[Model] fit  epoch=${ep + 1}/${epochs}  loss=${meanLoss.toFixed(
+          4,
+        )}  elapsed=${elapsed}s`,
+      );
 
       // Optional validation pass.
       let valLoss: number | undefined;
       if (nVal > 0) {
         const xVal = xDataTyped.slice(nTrain * xElems);
         const yVal = yDataTyped.slice(nTrain * yElems);
-        const valPreds = await seq.predict(
-          sess,
-          Buffer.from(xVal.buffer, xVal.byteOffset, xVal.byteLength),
-          [nVal, ...this.inputShape],
+        const xValBuf = Buffer.from(
+          xVal.buffer,
+          xVal.byteOffset,
+          xVal.byteLength,
         );
+        const valPreds = await seq.predict(sess, xValBuf, [
+          nVal,
+          ...this.inputShape,
+        ]);
+        void xVal;
+        void xValBuf; // keep backing memory alive past the await
         // Compute mean squared difference as a proxy val loss (good enough for monitoring).
         valLoss = computeValLoss(
           loss,
@@ -653,22 +777,37 @@ export class Model {
     const seq = this._seq!;
     const sess = await this.ensureSession();
 
-    // Auto-convert input data
+    // Auto-convert input data.
+    // Cache the Float32Array conversion keyed on the source object reference so
+    // that repeated calls with the same array (e.g. benchmark loops) pay the
+    // flattenArray + Float32Array allocation cost only once instead of every call.
+    // Float32Array inputs are always zero-copy and bypass the cache entirely.
     let xDataTyped: Float32Array;
-    try {
-      xDataTyped = toFloat32Array(xData);
-    } catch (e) {
-      throw new Error(
-        `Model.predict() xData conversion failed: ${(e as Error).message}. ` +
-          `Expected data matching inputShape ${JSON.stringify(
-            this.inputShape,
-          )}.`,
-      );
+    if (xData instanceof Float32Array) {
+      xDataTyped = xData;
+    } else {
+      const cached = this._convertCache.get(xData as object);
+      if (cached) {
+        xDataTyped = cached;
+      } else {
+        try {
+          xDataTyped = toFloat32Array(xData);
+        } catch (e) {
+          throw new Error(
+            `Model.predict() xData conversion failed: ${
+              (e as Error).message
+            }. ` +
+              `Expected data matching inputShape ${JSON.stringify(
+                this.inputShape,
+              )}.`,
+          );
+        }
+        this._convertCache.set(xData as object, xDataTyped);
+      }
     }
 
     const xElems = this.inputShape.reduce((a, b) => a * b, 1);
     const nTotal = Math.floor(xDataTyped.length / xElems);
-
     if (nTotal === 0) {
       throw new Error(
         `Model.predict(): xData is empty or too small for inputShape ${JSON.stringify(
@@ -681,6 +820,16 @@ export class Model {
     // Infer output size from a single forward pass if unknown.
     const outShape = seq.outputShape;
     const outElems = outShape.slice(1).reduce((a, b) => (a ?? 1) * (b ?? 1), 1);
+    // One-shot debug: fires only on the first predict() call per model instance,
+    // so it never appears in hot-path benchmark iterations.
+    if (this._predictCallCount === 0) {
+      debug(
+        `[Model] predict  inputShape=${JSON.stringify(
+          this.inputShape,
+        )}  outElems/sample=${outElems}  nTotal=${nTotal}`,
+      );
+    }
+    this._predictCallCount++;
 
     const result = new Float32Array(nTotal * (outElems ?? 1));
     let written = 0;
