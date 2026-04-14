@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.17
+
+### Patch Changes
+
+- fc89067: Performance fixes
+
 ## 0.0.0-alpha.16
 
 ### Patch Changes
