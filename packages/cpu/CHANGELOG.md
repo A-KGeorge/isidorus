@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.18
+
+### Patch Changes
+
+- 688b297: Custom mkl + fma/avx2 binary for linux
+
 ## 0.0.0-alpha.17
 
 ### Patch Changes
