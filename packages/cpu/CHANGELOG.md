@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.20
+
+### Patch Changes
+
+- f7091d8: Fixed libtensorflow download
+
 ## 0.0.0-alpha.19
 
 ### Patch Changes

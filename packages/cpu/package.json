@@ -1,6 +1,6 @@
 {
     "name": "@isidorus/cpu",
-    "version": "0.0.0-alpha.19",
+    "version": "0.0.0-alpha.20",
     "description": "Tensorflow CPU graph construction, training, and inference for Node.js",
     "type": "module",
     "main": "./dist/index.js",
