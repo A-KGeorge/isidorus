@@ -127,9 +127,11 @@ function detectLinuxVariant() {
 
   const flags = readCpuFlags();
   console.log(
-    `[isidorus] CPU flags detected: ${flags.size > 0 ? Array.from(flags).join(" ") : "(none)"}`,
+    `[isidorus] CPU flags detected: ${
+      flags.size > 0 ? Array.from(flags).join(" ") : "(none)"
+    }`,
   );
-  
+
   if (flags.has("avx2") && flags.has("fma")) {
     console.log(`[isidorus] AVX2 + FMA detected → using mkl-avx2`);
     return "mkl-avx2";
@@ -138,7 +140,7 @@ function detectLinuxVariant() {
     console.log(`[isidorus] Generic x86_64 detected → using mkl (legacy)`);
     return "mkl";
   }
-  
+
   // /proc/cpuinfo unreadable — use official build.
   console.log(`[isidorus] Could not detect CPU flags → using official build`);
   return "cpu";
