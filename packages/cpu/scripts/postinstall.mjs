@@ -2,106 +2,219 @@
  * scripts/install.mjs — @isidorus/cpu post-install script.
  *
  * Downloads the prebuilt TensorFlow C library for the current platform and
- * architecture and places it at:
+ * places it at:
  *
  *   {packageRoot}/libtf/
  *     include/   — headers (needed for compilation from source)
- *     lib/       — shared libraries (tensorflow.dll / .so / .dylib)
+ *     lib/       — shared libraries (libtensorflow.so / .dylib / tensorflow.dll)
  *
- * The prebuilt `.node` files shipped in prebuilds/ have their RPATH set to
- * $ORIGIN/../libtf/lib (Linux) / @loader_path/../libtf/lib (macOS) so the
- * dynamic linker finds libtensorflow without any PATH or LD_LIBRARY_PATH
- * modification required at runtime.
+ * ── Build variant selection (Linux x86_64 only) ────────────────────────────
  *
- * On Windows there is no RPATH equivalent. The script writes the lib directory
- * into the user's PATH via `setx` so the DLL is found by the OS loader.
+ * On Linux x86_64 we ship custom MKL-linked builds from the isidorus GitHub
+ * releases, which significantly outperform the official CPU build on modern
+ * hardware (oneDNN + MKL-DNN kernel selection, AVX2/FMA code paths).
  *
- * Skip conditions (checked in order):
- *   1. SKIP_LIBTF_DOWNLOAD=1         — CI or user explicitly opts out
- *   2. LIBTENSORFLOW_PATH is set      — user is managing TF themselves
- *   3. libtf/lib/{lib} already exists — already installed, nothing to do
+ * Variants (in priority order):
+ *   mkl-avx2   MKL + AVX2 + FMA — best performance, requires Haswell (2013+)
+ *   mkl        MKL only — compatible with any x86_64; still faster than vanilla
+ *   cpu        Official libtensorflow.so from storage.googleapis.com (fallback)
  *
- * Override the download URL for air-gapped environments:
- *   LIBTF_DOWNLOAD_URL=https://my-mirror.internal/libtensorflow-cpu-linux-x86_64.tar.gz
+ * Variant selection:
+ *   1. LIBTF_VARIANT env var   — force a specific variant (mkl-avx2 | mkl | cpu)
+ *   2. /proc/cpuinfo flags     — auto-detect avx2 + fma → mkl-avx2, else mkl
+ *   3. GitHub download fails   — falls back to official TF automatically
+ *
+ * Other platforms (arm64 Linux, macOS, Windows) always use the official build
+ * and skip the variant logic entirely.
+ *
+ * ── RPATH ─────────────────────────────────────────────────────────────────
+ *
+ * Prebuilt .node files have RPATH set to:
+ *   Linux:  $ORIGIN/../libtf/lib
+ *   macOS:  @loader_path/../libtf/lib
+ *
+ * No LD_LIBRARY_PATH or PATH modification is required at runtime.
+ * Windows uses PATH injection in install-libtensorflow.ts instead.
+ *
+ * ── Skip conditions ────────────────────────────────────────────────────────
+ *   SKIP_LIBTF_DOWNLOAD=1       — CI or explicit opt-out
+ *   LIBTENSORFLOW_PATH is set   — user manages TF themselves
+ *   libtf/lib/{lib} exists      — already installed
+ *
+ * ── Air-gap / mirror override ──────────────────────────────────────────────
+ *   LIBTF_DOWNLOAD_URL=https://mirror/libtensorflow-....tar.gz
+ *   (overrides both the variant URL and the official URL fallback)
  */
 
 import {
   existsSync,
   mkdirSync,
-  createWriteStream,
+  readFileSync,
   writeFileSync,
   readdirSync,
-  copyFileSync,
   renameSync,
   symlinkSync,
   unlinkSync,
+  createWriteStream,
+  cpSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { platform, arch } from "node:os";
+import { platform, arch, tmpdir } from "node:os";
 import { get } from "node:https";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { tmpdir } from "node:os";
 
 const execAsync = promisify(exec);
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const TF_VERSION = "2.18.1";
-const TF_BASE_URL = `https://storage.googleapis.com/tensorflow/versions/${TF_VERSION}`;
+const TF_OFFICIAL_BASE = `https://storage.googleapis.com/tensorflow/versions/${TF_VERSION}`;
 
-// Package root is one level up from scripts/.
+/**
+ * GitHub Releases base URL for isidorus tensorflow binaries (Linux only).
+ * Downloads a timestamped release tarball containing libtensorflow/linux-avx2 and libtensorflow/linux-legacy.
+ * For custom releases, set LIBTF_RELEASE_TAG environment variable.
+ */
+const LIBTF_RELEASE_TAG =
+  process.env.LIBTF_RELEASE_TAG || "tensorflow-binaries-latest";
+const ISIDORUS_RELEASES = `https://github.com/A-KGeorge/isidorus/releases/download/${LIBTF_RELEASE_TAG}`;
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_DIR = dirname(__dirname);
+const WORKSPACE_ROOT = dirname(dirname(PACKAGE_DIR)); // Go up from packages/cpu to workspace root
 const LIBTF_DIR = join(PACKAGE_DIR, "libtf");
 
-// ── Platform detection ────────────────────────────────────────────────────────
+// ── CPU capability detection ──────────────────────────────────────────────────
+
+/**
+ * Read /proc/cpuinfo and return the set of CPU flags for the first processor.
+ * Returns an empty Set on any error (e.g. non-Linux, no /proc).
+ */
+function readCpuFlags() {
+  try {
+    const cpuinfo = readFileSync("/proc/cpuinfo", "utf8");
+    const match = cpuinfo.match(/^flags\s*:\s*(.+)$/m);
+    if (!match) return new Set();
+    return new Set(match[1].trim().split(/\s+/));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Choose the best available MKL variant for this CPU.
+ * Returns: "mkl-avx2" | "mkl" | "cpu"
+ *
+ *   mkl-avx2 — AVX2 + FMA required (Intel Haswell 2013+, AMD Zen 1 2017+)
+ *   mkl      — any x86_64; MKL without AVX2 specialisation
+ *   cpu      — fall back to official libtensorflow (no MKL)
+ */
+function detectLinuxVariant() {
+  const forced = process.env.LIBTF_VARIANT;
+  if (forced) {
+    if (!["mkl-avx2", "mkl", "cpu"].includes(forced)) {
+      console.warn(
+        `[isidorus] Unknown LIBTF_VARIANT="${forced}". ` +
+          `Valid: mkl-avx2 | mkl | cpu. Falling back to auto-detect.`,
+      );
+    } else {
+      console.log(`[isidorus] LIBTF_VARIANT=${forced} (forced)`);
+      return forced;
+    }
+  }
+
+  const flags = readCpuFlags();
+  if (flags.has("avx2") && flags.has("fma")) return "mkl-avx2";
+  if (flags.size > 0) return "mkl";
+  // /proc/cpuinfo unreadable — use official build.
+  return "cpu";
+}
+
+// ── Platform spec ─────────────────────────────────────────────────────────────
 
 function getPlatformSpec() {
   const os = platform();
   const cpu = arch();
 
+  // ── Linux ────────────────────────────────────────────────────────────────
   if (os === "linux") {
     const archStr = cpu === "arm64" ? "aarch64" : "x86_64";
+    const officialTarball = `libtensorflow-cpu-linux-${archStr}.tar.gz`;
+    const officialUrl = `${TF_OFFICIAL_BASE}/${officialTarball}`;
+
+    let primaryUrl = officialUrl;
+    let primaryLabel = "official";
+    let variantTag = "cpu";
+
+    // For x86_64, download from isidorus releases (contains both AVX2 and legacy variants).
+    if (cpu === "x86_64") {
+      variantTag = detectLinuxVariant();
+      if (variantTag === "mkl-avx2") {
+        primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-avx2.tar.gz`;
+        primaryLabel = "AVX2 + FMA optimized (isidorus release)";
+      } else if (variantTag === "mkl") {
+        primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
+        primaryLabel = "Legacy CPU optimized (isidorus release)";
+      }
+    }
+
     return {
       libFile: "libtensorflow.so",
-      tarball: `libtensorflow-cpu-linux-${archStr}.tar.gz`,
-      extractCmd: (src, dst) => `tar -C '${dst}' -xzf '${src}'`,
+      tarball: officialTarball,
+      primaryUrl,
+      primaryLabel,
+      // Provide official URL as fallback only when a custom build was attempted.
+      fallbackUrl: variantTag !== "cpu" ? officialUrl : null,
+      extractCmd: (src, dst) => {
+        // The isidorus tarballs contain linux-avx2/ or linux-legacy/ at the top level
+        // We extract to a temp location, then move the contents up
+        return variantTag !== "cpu"
+          ? `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && mv '${dst}'/{linux-avx2,linux-legacy}/* '${dst}'/ 2>/dev/null || true`
+          : `tar -C '${dst}' -xzf '${src}'`;
+      },
       postExtract: async () => {
-        // Refresh the dynamic linker cache if ldconfig is available.
-        // This is best-effort — failure doesn't break the install.
         try {
           await execAsync("ldconfig " + join(LIBTF_DIR, "lib"));
         } catch {}
       },
       winPath: null,
+      variantTag,
     };
   }
 
+  // ── macOS ────────────────────────────────────────────────────────────────
   if (os === "darwin") {
     const archStr = cpu === "arm64" ? "arm64" : "x86_64";
+    const tarball = `libtensorflow-cpu-darwin-${archStr}.tar.gz`;
     return {
       libFile: "libtensorflow.dylib",
-      tarball: `libtensorflow-cpu-darwin-${archStr}.tar.gz`,
+      tarball,
+      primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
+      primaryLabel: "official",
+      fallbackUrl: null,
       extractCmd: (src, dst) => `tar -C '${dst}' -xzf '${src}'`,
       postExtract: async () => {},
       winPath: null,
+      variantTag: "cpu",
     };
   }
 
+  // ── Windows ──────────────────────────────────────────────────────────────
   if (os === "win32") {
+    const tarball = "libtensorflow-cpu-windows-x86_64.zip";
     return {
       libFile: "tensorflow.dll",
-      tarball: "libtensorflow-cpu-windows-x86_64.zip",
+      tarball,
+      primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
+      primaryLabel: "official",
+      fallbackUrl: null,
       extractCmd: (src, dst) =>
         `powershell -NoProfile -Command "Expand-Archive -Path '${src}' -DestinationPath '${dst}' -Force"`,
-      postExtract: async () => {
-        // No permanent PATH modifications required.
-        // install-libtensorflow.ts handles injecting the path into process.env.PATH
-        // at runtime to resolve tensorflow.dll without requiring a terminal restart.
-      },
+      postExtract: async () => {},
       winPath: join(LIBTF_DIR, "lib"),
+      variantTag: "cpu",
     };
   }
 
@@ -111,119 +224,76 @@ function getPlatformSpec() {
 // ── Skip conditions ───────────────────────────────────────────────────────────
 
 function shouldSkip(spec) {
-  // Explicit opt-out.
   if (process.env.SKIP_LIBTF_DOWNLOAD === "1") {
-    console.log(
-      "[isidorus] SKIP_LIBTF_DOWNLOAD=1 — skipping libtensorflow download.",
-    );
+    console.log("[isidorus] SKIP_LIBTF_DOWNLOAD=1 — skipping.");
     return true;
   }
-
-  // User is managing TF themselves via LIBTENSORFLOW_PATH.
   if (process.env.LIBTENSORFLOW_PATH) {
     console.log(
-      `[isidorus] LIBTENSORFLOW_PATH is set — skipping download (${process.env.LIBTENSORFLOW_PATH}).`,
+      `[isidorus] LIBTENSORFLOW_PATH is set — skipping (${process.env.LIBTENSORFLOW_PATH}).`,
     );
     return true;
   }
-
-  // Already installed.
   const libPath = join(LIBTF_DIR, "lib", spec.libFile);
   if (existsSync(libPath)) {
     console.log(`[isidorus] libtensorflow already installed at ${LIBTF_DIR}.`);
     return true;
   }
-
   return false;
 }
 
 // ── Library relocation ────────────────────────────────────────────────────────
 
-/**
- * Move shared libraries to prebuilds/{platform}-{arch} to avoid duplication
- * and let the prebuilt .node file find them via RPATH ($ORIGIN on Linux,
- * @loader_path on macOS).
- *
- * For source-based compilation compatibility, create symlinks back from
- * libtf/lib/ to prebuilds/, so tools that expect libraries in libtf/lib
- * can still find them.
- *
- * On Windows, this is not needed since the DLL is found via PATH.
- */
 function moveLibrariesToPrebuilds(spec) {
   const os = platform();
-  if (os === "win32") {
-    return; // Windows uses PATH, not needed
-  }
+  if (os === "win32") return;
 
   const libDir = join(LIBTF_DIR, "lib");
-  if (!existsSync(libDir)) {
-    return; // Nothing to move if lib dir doesn't exist
-  }
+  if (!existsSync(libDir)) return;
 
-  let libFilePatterns = [];
-  if (os === "linux") {
-    libFilePatterns = [".so", ".so.2", ".so.2.18.1"];
-  } else if (os === "darwin") {
-    libFilePatterns = [".dylib", ".dylib.2", ".dylib.2.18.1"];
-  } else {
-    return;
-  }
+  const libFilePatterns =
+    os === "linux"
+      ? [".so", ".so.2", ".so.2.18.1"]
+      : [".dylib", ".dylib.2", ".dylib.2.18.1"];
 
   const cpu = arch();
-  // Use Node.js arch naming for prebuilds directory (x64, not x86_64)
   const platformStr = os === "darwin" ? `darwin-${cpu}` : `linux-${cpu}`;
   const prebuildsDir = join(PACKAGE_DIR, "prebuilds", platformStr);
-
   mkdirSync(prebuildsDir, { recursive: true });
 
   try {
-    const files = readdirSync(libDir);
     let movedCount = 0;
-
-    for (const file of files) {
-      // Match files ending with our library extensions
+    for (const file of readdirSync(libDir)) {
       if (
-        libFilePatterns.some((pattern) => file.includes(pattern)) &&
-        file.startsWith("libtensorflow")
+        file.startsWith("libtensorflow") &&
+        libFilePatterns.some((p) => file.includes(p))
       ) {
         const src = join(libDir, file);
         const dst = join(prebuildsDir, file);
         const symlink = join(libDir, file);
-
         try {
-          // Move file to prebuilds
           renameSync(src, dst);
-
-          // Create symlink back for source compilation compatibility
           try {
-            // Remove any existing symlink/file first
-            if (existsSync(symlink)) {
-              unlinkSync(symlink);
-            }
-            // Create relative symlink: libtf/lib/libtensorflow.so -> ../../../prebuilds/linux-x64/libtensorflow.so
-            const relPath = join("..", "..", "prebuilds", platformStr, file);
-            symlinkSync(relPath, symlink);
+            if (existsSync(symlink)) unlinkSync(symlink);
+            symlinkSync(
+              join("..", "..", "prebuilds", platformStr, file),
+              symlink,
+            );
           } catch (e) {
-            // Symlink creation failed (might be Windows-like filesystem)
-            // Non-fatal — the important thing is the file is in prebuilds
             console.warn(
               `[isidorus] symlink warning for ${file}: ${e.message}`,
             );
           }
-
           movedCount++;
         } catch (e) {
           console.warn(`[isidorus] failed to move ${file}: ${e.message}`);
         }
       }
     }
-
-    if (movedCount > 0) {
+    if (movedCount > 0)
       console.log(
         `  Moved ${movedCount} library files to prebuilds/${platformStr}/`,
       );
-    }
   } catch (e) {
     console.warn(`[isidorus] library move warning: ${e.message}`);
   }
@@ -249,8 +319,8 @@ function downloadFile(url, dest) {
         }
 
         const total = parseInt(res.headers["content-length"] ?? "0", 10);
-        let downloaded = 0;
-        let lastPct = -1;
+        let downloaded = 0,
+          lastPct = -1;
 
         res.on("data", (chunk) => {
           downloaded += chunk.length;
@@ -289,40 +359,64 @@ async function main() {
   } catch (e) {
     console.warn(`[isidorus] ${e.message}`);
     console.warn(
-      "[isidorus] Set LIBTENSORFLOW_PATH to your TF install directory and rebuild.",
+      "[isidorus] Set LIBTENSORFLOW_PATH to your TF directory and rebuild.",
     );
     return;
   }
 
   if (shouldSkip(spec)) return;
 
-  const downloadUrl =
-    process.env.LIBTF_DOWNLOAD_URL ?? `${TF_BASE_URL}/${spec.tarball}`;
+  // User URL override takes precedence over everything.
+  const overrideUrl = process.env.LIBTF_DOWNLOAD_URL ?? null;
+  const downloadUrl = overrideUrl ?? spec.primaryUrl;
   const tmpFile = join(tmpdir(), spec.tarball);
 
   console.log(`\n[isidorus] Installing libtensorflow ${TF_VERSION}...`);
   console.log(`  Platform : ${platform()}-${arch()}`);
-  console.log(`  Tarball  : ${spec.tarball}`);
+  if (spec.variantTag !== "cpu" && !overrideUrl) {
+    console.log(`  Variant  : ${spec.variantTag} (${spec.primaryLabel})`);
+    console.log(`  Override : LIBTF_VARIANT=cpu to force the official build`);
+  }
   console.log(`  Dest     : ${LIBTF_DIR}\n`);
 
   mkdirSync(LIBTF_DIR, { recursive: true });
 
+  // ── Attempt primary download ──────────────────────────────────────────────
+  let downloadedUrl = downloadUrl;
   try {
     await downloadFile(downloadUrl, tmpFile);
-  } catch (e) {
-    console.error(`\n[isidorus] Download failed: ${e.message}`);
-    console.error(
-      `[isidorus] You can download manually and set LIBTENSORFLOW_PATH:`,
-    );
-    console.error(`  ${downloadUrl}`);
-    // Non-fatal — user can install manually.
-    return;
+  } catch (primaryErr) {
+    if (spec.fallbackUrl && !overrideUrl) {
+      console.warn(
+        `\n[isidorus] Custom build unavailable: ${primaryErr.message}`,
+      );
+      console.warn(
+        `[isidorus] Falling back to official libtensorflow (no MKL)...`,
+      );
+      console.warn(
+        `[isidorus] Tip: set LIBTF_VARIANT=cpu to skip the custom build.\n`,
+      );
+      try {
+        await downloadFile(spec.fallbackUrl, tmpFile);
+        downloadedUrl = spec.fallbackUrl;
+      } catch (fallbackErr) {
+        console.error(
+          `\n[isidorus] Fallback also failed: ${fallbackErr.message}`,
+        );
+        console.error(`[isidorus] Install manually:\n  ${spec.fallbackUrl}`);
+        return;
+      }
+    } else {
+      console.error(`\n[isidorus] Download failed: ${primaryErr.message}`);
+      console.error(`[isidorus] Install manually:\n  ${downloadUrl}`);
+      return;
+    }
   }
 
+  // ── Extract ───────────────────────────────────────────────────────────────
   console.log(`  Extracting to ${LIBTF_DIR}...`);
   try {
-    const cmd = spec.extractCmd(tmpFile, LIBTF_DIR);
-    await execAsync(cmd);
+    await execAsync(spec.extractCmd(tmpFile, LIBTF_DIR));
   } catch (e) {
     console.error(`[isidorus] Extraction failed: ${e.message}`);
     console.error(
@@ -331,22 +425,18 @@ async function main() {
     return;
   }
 
-  // Platform-specific post-install (ldconfig, PATH modification, etc.)
   await spec.postExtract();
-
-  // Move shared libraries to prebuilds dir to avoid duplication.
-  // Creates symlinks back to libtf/lib/ for source compilation compatibility.
   moveLibrariesToPrebuilds(spec);
 
-  // Write a config file so the runtime resolver can find TF even without
-  // LIBTENSORFLOW_PATH being set in the environment.
-  const configPath = join(PACKAGE_DIR, ".libtf-config.json");
+  // ── Write config ──────────────────────────────────────────────────────────
   writeFileSync(
-    configPath,
+    join(PACKAGE_DIR, ".libtf-config.json"),
     JSON.stringify(
       {
         version: TF_VERSION,
+        variant: spec.variantTag,
         installedAt: new Date().toISOString(),
+        sourceUrl: downloadedUrl,
         libtfDir: LIBTF_DIR,
         platform: platform(),
         arch: arch(),
@@ -356,12 +446,13 @@ async function main() {
     ),
   );
 
+  // ── Verify ────────────────────────────────────────────────────────────────
   const libPath = join(LIBTF_DIR, "lib", spec.libFile);
   if (!existsSync(libPath)) {
     console.error(`[isidorus] ⚠  ${spec.libFile} not found after extraction.`);
     console.error(`[isidorus]    Expected: ${libPath}`);
     console.error(
-      `[isidorus]    The archive structure may have changed — check ${LIBTF_DIR}.`,
+      `[isidorus]    Archive structure may differ — check ${LIBTF_DIR}.`,
     );
     return;
   }
@@ -370,6 +461,9 @@ async function main() {
     `\n[isidorus] libtensorflow ${TF_VERSION} installed successfully.`,
   );
   console.log(`  Library  : ${libPath}`);
+  if (spec.variantTag !== "cpu") {
+    console.log(`  Variant  : ${spec.variantTag} — MKL-optimized`);
+  }
   if (platform() !== "win32") {
     console.log(
       `\n  Prebuilt .node files resolve the library automatically via RPATH.`,
@@ -382,7 +476,7 @@ async function main() {
 }
 
 main().catch((e) => {
-  // Never throw from postinstall — a failed optional download should not
+  // Never throw from postinstall — a failed optional download must not
   // break `npm install` for the parent project.
   console.warn(`[isidorus] post-install warning: ${e.message}`);
 });

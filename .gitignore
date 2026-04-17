@@ -7,3 +7,6 @@ build/
 
 # Explicitly allow prebuilds
 !packages/*/prebuilds/
+
+# TensorFlow binary tarballs (released manually)
+tensorflow-binaries-*.tar.gz
