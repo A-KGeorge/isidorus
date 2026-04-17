@@ -223,6 +223,17 @@ function getPlatformSpec() {
 
 // ── Skip conditions ───────────────────────────────────────────────────────────
 
+function getInstalledVariant() {
+  try {
+    const configPath = join(PACKAGE_DIR, ".libtf-config.json");
+    if (!existsSync(configPath)) return null;
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    return config.variant;
+  } catch {
+    return null;
+  }
+}
+
 function shouldSkip(spec) {
   if (process.env.SKIP_LIBTF_DOWNLOAD === "1") {
     console.log("[isidorus] SKIP_LIBTF_DOWNLOAD=1 — skipping.");
@@ -234,12 +245,42 @@ function shouldSkip(spec) {
     );
     return true;
   }
+
   const libPath = join(LIBTF_DIR, "lib", spec.libFile);
-  if (existsSync(libPath)) {
-    console.log(`[isidorus] libtensorflow already installed at ${LIBTF_DIR}.`);
+  if (!existsSync(libPath)) {
+    return false; // Library doesn't exist, need to download
+  }
+
+  // Library exists — check if it's the correct variant for this CPU
+  const installedVariant = getInstalledVariant();
+  if (installedVariant === spec.variantTag) {
+    console.log(
+      `[isidorus] libtensorflow ${spec.variantTag} already installed at ${LIBTF_DIR}.`,
+    );
     return true;
   }
-  return false;
+
+  // Variant mismatch — re-download the correct one
+  console.log(
+    `[isidorus] Variant mismatch: installed ${installedVariant}, but CPU supports ${spec.variantTag}.`,
+  );
+  console.log(`[isidorus] Re-downloading correct variant...`);
+
+  // Clean up old binaries before re-downloading
+  try {
+    const libDir = join(LIBTF_DIR, "lib");
+    if (existsSync(libDir)) {
+      for (const file of readdirSync(libDir)) {
+        if (file.startsWith("libtensorflow")) {
+          unlinkSync(join(libDir, file));
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[isidorus] Warning cleaning old binaries: ${e.message}`);
+  }
+
+  return false; // Force re-download
 }
 
 // ── Library relocation ────────────────────────────────────────────────────────
