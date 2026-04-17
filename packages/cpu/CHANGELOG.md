@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.19
+
+### Patch Changes
+
+- ef0bb0f: Fixed postinstall to load correct file.
+
 ## 0.0.0-alpha.18
 
 ### Patch Changes
