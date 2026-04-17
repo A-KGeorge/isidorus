@@ -126,9 +126,21 @@ function detectLinuxVariant() {
   }
 
   const flags = readCpuFlags();
-  if (flags.has("avx2") && flags.has("fma")) return "mkl-avx2";
-  if (flags.size > 0) return "mkl";
+  console.log(
+    `[isidorus] CPU flags detected: ${flags.size > 0 ? Array.from(flags).join(" ") : "(none)"}`,
+  );
+  
+  if (flags.has("avx2") && flags.has("fma")) {
+    console.log(`[isidorus] AVX2 + FMA detected → using mkl-avx2`);
+    return "mkl-avx2";
+  }
+  if (flags.size > 0) {
+    console.log(`[isidorus] Generic x86_64 detected → using mkl (legacy)`);
+    return "mkl";
+  }
+  
   // /proc/cpuinfo unreadable — use official build.
+  console.log(`[isidorus] Could not detect CPU flags → using official build`);
   return "cpu";
 }
 
@@ -169,10 +181,13 @@ function getPlatformSpec() {
       fallbackUrl: variantTag !== "cpu" ? officialUrl : null,
       extractCmd: (src, dst) => {
         // The isidorus tarballs contain linux-avx2/ or linux-legacy/ at the top level
-        // We extract to a temp location, then move the contents up
-        return variantTag !== "cpu"
-          ? `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && mv '${dst}'/{linux-avx2,linux-legacy}/* '${dst}'/ 2>/dev/null || true`
-          : `tar -C '${dst}' -xzf '${src}'`;
+        // We extract them and properly move contents
+        if (variantTag === "mkl-avx2") {
+          return `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && [ -d '${dst}/linux-avx2' ] && mv '${dst}/linux-avx2'/* '${dst}/' || true`;
+        } else if (variantTag === "mkl") {
+          return `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && [ -d '${dst}/linux-legacy' ] && mv '${dst}/linux-legacy'/* '${dst}/' || true`;
+        }
+        return `tar -C '${dst}' -xzf '${src}'`;
       },
       postExtract: async () => {
         try {
@@ -413,12 +428,11 @@ async function main() {
   const tmpFile = join(tmpdir(), spec.tarball);
 
   console.log(`\n[isidorus] Installing libtensorflow ${TF_VERSION}...`);
-  console.log(`  Platform : ${platform()}-${arch()}`);
-  if (spec.variantTag !== "cpu" && !overrideUrl) {
-    console.log(`  Variant  : ${spec.variantTag} (${spec.primaryLabel})`);
-    console.log(`  Override : LIBTF_VARIANT=cpu to force the official build`);
-  }
-  console.log(`  Dest     : ${LIBTF_DIR}\n`);
+  console.log(`  Platform  : ${platform()}-${arch()}`);
+  console.log(`  Variant   : ${spec.variantTag}`);
+  console.log(`  Label     : ${spec.primaryLabel}`);
+  console.log(`  Download  : ${downloadUrl.split("?")[0]}`); // Hide query params if any
+  console.log(`  Dest      : ${LIBTF_DIR}\n`);
 
   mkdirSync(LIBTF_DIR, { recursive: true });
 
