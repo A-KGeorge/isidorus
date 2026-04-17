@@ -161,17 +161,30 @@ function getPlatformSpec() {
     let primaryUrl = officialUrl;
     let primaryLabel = "official";
     let variantTag = "cpu";
+    let fallbackUrl = null;
 
-    // For x86_64, download from isidorus releases (contains both AVX2 and legacy variants).
-    if (cpu === "x86_64") {
+    // For x64 (x86_64), ALWAYS try isidorus releases first (with fallback to official)
+    if (cpu === "x64") {
       variantTag = detectLinuxVariant();
-      if (variantTag === "mkl-avx2") {
+
+      // Determine which GitHub release to try first
+      let githubVariant = variantTag;
+      if (variantTag === "cpu") {
+        // CPU detection failed, but we'll still try the legacy variant from GitHub
+        // It's more likely to work than the official build
+        githubVariant = "mkl";
+      }
+
+      if (githubVariant === "mkl-avx2") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-avx2.tar.gz`;
         primaryLabel = "AVX2 + FMA optimized (isidorus release)";
-      } else if (variantTag === "mkl") {
+      } else if (githubVariant === "mkl") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
         primaryLabel = "Legacy CPU optimized (isidorus release)";
       }
+
+      // Always provide official as fallback for x86_64
+      fallbackUrl = officialUrl;
     }
 
     return {
@@ -179,14 +192,13 @@ function getPlatformSpec() {
       tarball: officialTarball,
       primaryUrl,
       primaryLabel,
-      // Provide official URL as fallback only when a custom build was attempted.
-      fallbackUrl: variantTag !== "cpu" ? officialUrl : null,
+      fallbackUrl,
       extractCmd: (src, dst) => {
         // The isidorus tarballs contain linux-avx2/ or linux-legacy/ at the top level
-        // We extract them and properly move contents
-        if (variantTag === "mkl-avx2") {
+        // Determine which variant directory to extract based on the URL
+        if (primaryUrl.includes("avx2")) {
           return `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && [ -d '${dst}/linux-avx2' ] && mv '${dst}/linux-avx2'/* '${dst}/' || true`;
-        } else if (variantTag === "mkl") {
+        } else if (primaryUrl.includes("legacy")) {
           return `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && [ -d '${dst}/linux-legacy' ] && mv '${dst}/linux-legacy'/* '${dst}/' || true`;
         }
         return `tar -C '${dst}' -xzf '${src}'`;
@@ -485,13 +497,49 @@ async function main() {
   await spec.postExtract();
   moveLibrariesToPrebuilds(spec);
 
+  // ── Clean up extracted files to conserve space (Linux only) ──────────────
+  // Windows keeps binaries in lib/ for PATH injection
+  // macOS uses lib/ for RPATH resolution
+  // Only Linux can safely remove lib/ since binaries are in prebuilds/
+  if (platform() === "linux") {
+    try {
+      const libDir = join(LIBTF_DIR, "lib");
+      const includeDir = join(LIBTF_DIR, "include");
+
+      // Aggressively remove lib and include directories
+      if (existsSync(libDir)) {
+        await execAsync(`rm -rf '${libDir}'`);
+        console.log(`  Removed lib directory to conserve space`);
+      }
+
+      if (existsSync(includeDir)) {
+        await execAsync(`rm -rf '${includeDir}'`);
+        console.log(`  Removed include directory to conserve space`);
+      }
+    } catch (e) {
+      console.warn(
+        `[isidorus] Warning cleaning up extracted files: ${e.message}`,
+      );
+    }
+  }
+
+  // ── Determine actual variant that was downloaded ──────────────────────────
+  let actualVariant = spec.variantTag;
+  if (downloadedUrl && downloadedUrl.includes("isidorus")) {
+    if (downloadedUrl.includes("avx2")) {
+      actualVariant = "mkl-avx2";
+    } else if (downloadedUrl.includes("legacy")) {
+      actualVariant = "mkl";
+    }
+  }
+
   // ── Write config ──────────────────────────────────────────────────────────
   writeFileSync(
     join(PACKAGE_DIR, ".libtf-config.json"),
     JSON.stringify(
       {
         version: TF_VERSION,
-        variant: spec.variantTag,
+        variant: actualVariant,
         installedAt: new Date().toISOString(),
         sourceUrl: downloadedUrl,
         libtfDir: LIBTF_DIR,
