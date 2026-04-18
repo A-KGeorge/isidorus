@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.21
+
+### Patch Changes
+
+- e2adc2c: Made security changes
+
 ## 0.0.0-alpha.20
 
 ### Patch Changes
