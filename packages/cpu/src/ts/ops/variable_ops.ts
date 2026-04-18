@@ -23,6 +23,62 @@ import { constant } from "./array_ops.js";
 //   sess.run([[x, feed]], [], ["step"]) ← training step (assign ops)
 // ---------------------------------------------------------------------------
 
+// ── Cryptographically secure random number source ─────────────────────
+
+let _randBuf: Float64Array | null = null;
+let _randIdx = 0;
+
+function _ensureBuffer(n: number): void {
+  const needed = Math.max(n, 1024);
+  if (!_randBuf || _randBuf.length < needed) {
+    _randBuf = new Float64Array(needed);
+  }
+}
+
+/**
+ * Returns a uniform random float in [0, 1) using the system CSPRNG.
+ * Semantically equivalent to Math.random() but unpredictable.
+ */
+function secureRandom(): number {
+  if (!_randBuf || _randIdx >= _randBuf.length) {
+    _ensureBuffer(1024);
+    // getRandomValues fills with uniform random uint64 values in [0, 2^64).
+    // We reinterpret as Uint32Array pairs, take the upper 32 bits of each
+    // pair, and divide by 2^32 to get floats in [0, 1).
+    const u32 = new Uint32Array(_randBuf!.buffer as ArrayBuffer);
+    crypto.getRandomValues(u32);
+    for (let i = 0; i < _randBuf!.length; i++) {
+      // Upper 32 bits of the i-th pair → uniform float in [0, 1)
+      _randBuf![i] = u32[i * 2 + 1] / 0x100000000;
+    }
+    _randIdx = 0;
+  }
+  return _randBuf![_randIdx++];
+}
+
+/**
+ * Fill a Float32Array of length n with CSPRNG-sourced uniform values
+ * in the range (-limit, +limit). Used by Glorot initialization.
+ */
+function uniformBuffer(n: number, limit: number): Buffer {
+  const buf = Buffer.allocUnsafe(n * 4);
+  for (let i = 0; i < n; i++) {
+    buf.writeFloatLE((secureRandom() * 2 - 1) * limit, i * 4);
+  }
+  return buf;
+}
+
+/**
+ * Box-Muller transform using CSPRNG source.
+ * Returns a normal(0, stddev) sample.
+ */
+function boxMuller(stddev: number): number {
+  // Guard against log(0) by replacing exact 0 with smallest positive float.
+  const u1 = secureRandom() || Number.MIN_VALUE;
+  const u2 = secureRandom();
+  return stddev * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
 // ── Variable handle ───────────────────────────────────────────────────────────
 
 /**
@@ -255,16 +311,13 @@ export function glorotUniformInitializer(
     fanIn = shape[shape.length - 2] * receptiveFieldSize;
     fanOut = shape[shape.length - 1] * receptiveFieldSize;
   } else if (shape.length === 1) {
-    fanIn = shape[0];
-    fanOut = shape[0];
+    fanIn = fanOut = shape[0];
   }
 
   const limit = Math.sqrt(6 / (fanIn + fanOut));
   const n = shape.reduce((a, b) => a * b, 1);
-  const buf = Buffer.allocUnsafe(n * 4);
-  for (let i = 0; i < n; i++) {
-    buf.writeFloatLE(Math.random() * 2 * limit - limit, i * 4);
-  }
+  // Fix 10: CSPRNG-sourced uniform buffer.
+  const buf = uniformBuffer(n, limit);
   return constant(g, buf, shape, dtype, name);
 }
 

@@ -2,6 +2,7 @@
 #include <napi.h>
 #include <string>
 #include <vector>
+#include <atomic>
 #include "platform_tf.h"
 
 #ifndef ISIDORUS_STATUS_GUARD_DEFINED
@@ -29,7 +30,7 @@ public:
 
 private:
     TF_Graph *graph_ = nullptr;
-    int op_counter_ = 0;
+    std::atomic<int> op_counter_{0};
 
     Napi::Value AddOp(const Napi::CallbackInfo &info);
     Napi::Value HasOp(const Napi::CallbackInfo &info);

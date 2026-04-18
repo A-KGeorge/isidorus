@@ -50,6 +50,8 @@ const T_BYTES = 0x07;
 const T_ARRAY = 0x08;
 const T_OBJECT = 0x09;
 
+const MAX_VALUE_BYTE_LENGTH = 256 * 1024 * 1024; // 256 MB
+
 // ── LEB128 varint ─────────────────────────────────────────────────────────────
 
 function varintSize(n: number): number {
@@ -73,17 +75,29 @@ function writeVarint(buf: Buffer, offset: number, n: number): number {
 function readVarint(
   buf: Buffer,
   offset: number,
+  checkLength = false,
 ): { value: number; offset: number } {
   let result = 0;
   let shift = 0;
   while (true) {
+    if (offset >= buf.length)
+      throw new RangeError("TOON: varint read past end of buffer");
     const byte = buf[offset++];
     result |= (byte & 0x7f) << shift;
     if (!(byte & 0x80)) break;
     shift += 7;
-    if (shift > 28) throw new RangeError("TOON: varint overflow");
+    if (shift > 28) throw new RangeError("TOON: varint overflow (> 28 bits)");
   }
-  return { value: result >>> 0, offset };
+  // Fix 8: coerce to unsigned 32-bit and verify it is a safe non-negative int.
+  const value = result >>> 0;
+  if (!Number.isSafeInteger(value) || value < 0)
+    throw new RangeError(`TOON: varint decoded to invalid value ${value}`);
+  // Fix 8: reject implausible lengths before any Buffer allocation.
+  if (checkLength && value > MAX_VALUE_BYTE_LENGTH)
+    throw new RangeError(
+      `TOON: value byte-length ${value} exceeds maximum ${MAX_VALUE_BYTE_LENGTH}`,
+    );
+  return { value, offset };
 }
 
 // ── Encoder ───────────────────────────────────────────────────────────────────
@@ -211,10 +225,27 @@ export function toonEncode(value: unknown): Buffer {
 // ── Decoder ───────────────────────────────────────────────────────────────────
 
 /** Read a key string (no tag byte — keys are bare length-prefixed utf8). */
+const BLOCKED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 function readKey(buf: Buffer, offset: number): { key: string; offset: number } {
-  const { value: len, offset: o1 } = readVarint(buf, offset);
+  // Fix 8: pass checkLength=true so oversized key lengths are rejected.
+  const { value: len, offset: o1 } = readVarint(buf, offset, true);
+  if (o1 + len > buf.length)
+    throw new RangeError("TOON: key string extends past end of buffer");
   const key = buf.toString("utf8", o1, o1 + len);
   return { key, offset: o1 + len };
+}
+
+function nullProtoToPlain(obj: Record<string | symbol, unknown>): object {
+  const plain = {};
+  for (const key of Object.getOwnPropertyNames(obj)) {
+    Object.defineProperty(
+      plain,
+      key,
+      Object.getOwnPropertyDescriptor(obj, key)!,
+    );
+  }
+  return plain;
 }
 
 function decodeValue(
@@ -260,15 +291,19 @@ function decodeValue(
     }
     case T_OBJECT: {
       const { value: count, offset: o1 } = readVarint(buf, offset);
-      const obj: Record<string, unknown> = {};
+      const obj = Object.create(null) as Record<string, unknown>;
       let o = o1;
       for (let i = 0; i < count; i++) {
         const kr = readKey(buf, o);
         const vr = decodeValue(buf, kr.offset);
-        obj[kr.key] = vr.value;
+
+        if (!BLOCKED_KEYS.has(kr.key)) {
+          obj[kr.key] = vr.value;
+        }
         o = vr.offset;
       }
-      return { value: obj, offset: o };
+
+      return { value: nullProtoToPlain(obj), offset: o };
     }
     default:
       throw new RangeError(

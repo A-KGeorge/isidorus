@@ -130,6 +130,18 @@ const AUTOTUNE_LARGE_MODEL_BYTES = 50 * 1024 * 1024; // 50 MB
 // much worse latency (e.g. 57ms vs 18ms for ResNet50 on a 24-core machine).
 const AUTOTUNE_LATENCY_PREFERENCE_MARGIN = 0.08; // 8%
 
+/**
+ *
+ * @returns The size of the libuv thread pool, which is the effective concurrency ceiling for TF sessions. Defaults to 4 if UV_THREADPOOL_SIZE is not set or invalid.
+ */
+
+function getUvPoolSize(): number {
+  const raw = parseInt(process.env["UV_THREADPOOL_SIZE"] ?? "", 10);
+  // Fix 14: NaN, negative, or astronomically large values all fall back to 4.
+  if (!Number.isFinite(raw) || raw < 1 || raw > 4096) return 4;
+  return raw;
+}
+
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 interface QueueEntry {
@@ -228,12 +240,11 @@ export class InferencePool {
     // UV_THREADPOOL_SIZE must be set BEFORE Node starts (in the environment
     // or via a loader), not at runtime. We clamp maxConcurrent to the actual
     // pool size so the autotuner doesn't pick a concurrency the pool can't serve.
-    const uvPoolSize = parseInt(process.env["UV_THREADPOOL_SIZE"] ?? "4", 10);
+    const uvPoolSize = getUvPoolSize();
     if (uvPoolSize < 8)
       warn(
         `UV_THREADPOOL_SIZE=${uvPoolSize} limits runAsync concurrency to ${uvPoolSize}. ` +
-          `Set UV_THREADPOOL_SIZE=<num_cores> before starting Node for full throughput. ` +
-          `Example: UV_THREADPOOL_SIZE=24 node server.js`,
+          `Set UV_THREADPOOL_SIZE=<num_cores> before starting Node for full throughput.`,
       );
     // Effective concurrency ceiling — we can't run more than the pool allows.
     const poolCap = uvPoolSize;
@@ -262,7 +273,7 @@ export class InferencePool {
         }),
       );
 
-    const warmSession = async (s: Session) => {
+    const warmSession = async (s: Session): Promise<void> => {
       // Three warmup passes: first populates oneDNN cache, rest stabilise
       // TF's internal thread pool and memory allocator.
       for (let i = 0; i < AUTOTUNE_WARMUP; i++)
@@ -303,7 +314,12 @@ export class InferencePool {
       }
       inter = opts.interOpThreads ?? Math.max(1, Math.min(4, maxConcurrent));
       sess = makeSession(intra, inter);
-      await warmSession(sess);
+      try {
+        await warmSession(sess);
+      } catch (e) {
+        sess.destroy();
+        throw e;
+      }
       debug(
         `InferencePool: expert mode — intra=${intra} inter=${inter} maxConcurrent=${maxConcurrent} (UV pool=${poolCap})`,
       );
@@ -313,7 +329,12 @@ export class InferencePool {
       maxConcurrent = 1;
       inter = opts.interOpThreads ?? 1;
       sess = makeSession(intra, inter);
-      await warmSession(sess);
+      try {
+        await warmSession(sess);
+      } catch (e) {
+        sess.destroy();
+        throw e;
+      }
       debug(`InferencePool: profile=latency — intra=${intra} maxConcurrent=1`);
     } else if (profile === "throughput") {
       // Throughput profile: split cores for concurrent requests, capped to UV pool.
@@ -324,7 +345,12 @@ export class InferencePool {
       );
       inter = opts.interOpThreads ?? Math.min(4, maxConcurrent);
       sess = makeSession(intra, inter);
-      await warmSession(sess);
+      try {
+        await warmSession(sess);
+      } catch (e) {
+        sess.destroy();
+        throw e;
+      }
       debug(
         `InferencePool: profile=throughput — intra=${intra} maxConcurrent=${maxConcurrent} (UV pool=${poolCap})`,
       );
@@ -365,6 +391,7 @@ export class InferencePool {
       );
 
       // Track results for tiebreaker after all candidates measured.
+      const allSessions: Session[] = [];
       const results: {
         rps: number;
         meanMs: number;
@@ -373,46 +400,34 @@ export class InferencePool {
         sess: Session;
       }[] = [];
 
-      for (const candidateIntra of candidates) {
-        // Clamp concurrency to what the UV pool can actually service.
-        const candidateConc = Math.min(
-          Math.max(1, Math.floor(usable / candidateIntra)),
-          poolCap,
-        );
-        const candidateInter = Math.max(1, Math.min(4, candidateConc));
-        const s = makeSession(candidateIntra, candidateInter);
+      try {
+        for (const candidateIntra of candidates) {
+          // Clamp concurrency to what the UV pool can actually service.
+          const candidateConc = Math.min(
+            Math.max(1, Math.floor(usable / candidateIntra)),
+            poolCap,
+          );
+          const candidateInter = Math.max(1, Math.min(4, candidateConc));
+          const s = makeSession(candidateIntra, candidateInter);
 
-        await warmSession(s);
+          allSessions.push(s);
 
-        // ── Measure sustained throughput via sliding window pipeline ────────
-        // Issue AUTOTUNE_ITERS × candidateConc total requests, maintaining
-        // exactly candidateConc in-flight at all times (like a real workload).
-        // This correctly measures sustained req/s for all concurrency levels:
-        //   - High maxConc: concurrent memory-bus pressure is captured
-        //   - Low maxConc (e.g. 1): slot stays busy — no idle gaps between rounds
-        const totalReqs = autotuneIters * Math.max(candidateConc, 1);
-        let completed = 0;
-        let issued = 0;
-        const inFlight = new Set<Promise<void>>();
-        const t0 = performance.now();
+          await warmSession(s);
 
-        // Seed with candidateConc in-flight requests.
-        while (issued < Math.min(candidateConc, totalReqs)) {
-          const p: Promise<void> = s
-            .runAsync(dummyFeeds, dummyFetches as any)
-            .catch(() => {})
-            .then(() => {
-              completed++;
-              inFlight.delete(p);
-            });
-          inFlight.add(p);
-          issued++;
-        }
+          // ── Measure sustained throughput via sliding window pipeline ────────
+          // Issue AUTOTUNE_ITERS × candidateConc total requests, maintaining
+          // exactly candidateConc in-flight at all times (like a real workload).
+          // This correctly measures sustained req/s for all concurrency levels:
+          //   - High maxConc: concurrent memory-bus pressure is captured
+          //   - Low maxConc (e.g. 1): slot stays busy — no idle gaps between rounds
+          const totalReqs = autotuneIters * Math.max(candidateConc, 1);
+          let completed = 0;
+          let issued = 0;
+          const inFlight = new Set<Promise<void>>();
+          const t0 = performance.now();
 
-        // As each completes, immediately issue the next — zero idle time.
-        while (completed < totalReqs) {
-          await Promise.race(inFlight);
-          while (issued < totalReqs && inFlight.size < candidateConc) {
+          // Seed with candidateConc in-flight requests.
+          while (issued < Math.min(candidateConc, totalReqs)) {
             const p: Promise<void> = s
               .runAsync(dummyFeeds, dummyFetches as any)
               .catch(() => {})
@@ -423,27 +438,52 @@ export class InferencePool {
             inFlight.add(p);
             issued++;
           }
+
+          // As each completes, immediately issue the next — zero idle time.
+          while (completed < totalReqs) {
+            await Promise.race(inFlight);
+            while (issued < totalReqs && inFlight.size < candidateConc) {
+              const p: Promise<void> = s
+                .runAsync(dummyFeeds, dummyFetches as any)
+                .catch(() => {})
+                .then(() => {
+                  completed++;
+                  inFlight.delete(p);
+                });
+              inFlight.add(p);
+              issued++;
+            }
+          }
+
+          const elapsedMs = performance.now() - t0;
+          const rps = (totalReqs * 1000) / elapsedMs;
+          const meanMs = elapsedMs / totalReqs;
+
+          debug(
+            `  intra=${String(candidateIntra).padStart(
+              2,
+            )} maxConc=${candidateConc} inter=${candidateInter} rps=${rps.toFixed(
+              1,
+            )} mean=${meanMs.toFixed(2)}ms`,
+          );
+
+          results.push({
+            rps,
+            meanMs,
+            intra: candidateIntra,
+            conc: candidateConc,
+            sess: s,
+          });
         }
-
-        const elapsedMs = performance.now() - t0;
-        const rps = (totalReqs * 1000) / elapsedMs;
-        const meanMs = elapsedMs / totalReqs;
-
-        debug(
-          `  intra=${String(candidateIntra).padStart(
-            2,
-          )} maxConc=${candidateConc} inter=${candidateInter} rps=${rps.toFixed(
-            1,
-          )} mean=${meanMs.toFixed(2)}ms`,
-        );
-
-        results.push({
-          rps,
-          meanMs,
-          intra: candidateIntra,
-          conc: candidateConc,
-          sess: s,
-        });
+      } catch (error) {
+        for (const s of allSessions) {
+          try {
+            s.destroy();
+          } catch {
+            /* ignore cleanup errors */
+          }
+        }
+        throw error;
       }
 
       // Best = highest measured req/s. Tiebreaker: within margin, prefer
@@ -453,7 +493,15 @@ export class InferencePool {
       const contenders = results.filter((r) => r.rps >= threshold);
       const winner = contenders.reduce((a, b) => (a.intra > b.intra ? a : b));
 
-      for (const r of results) if (r.intra !== winner.intra) r.sess.destroy();
+      for (const r of results) {
+        if (r.sess !== winner.sess) {
+          try {
+            r.sess.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
 
       intra = winner.intra;
       maxConcurrent = winner.conc;

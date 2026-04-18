@@ -221,6 +221,17 @@ export function layerNorm(
   return add(g, mul(g, scale, xNorm), offset, name);
 }
 
+export interface DropoutSeedResult {
+  /** The [2] int32 tensor to pass as `seed` to dropout(). */
+  seed: Tensor;
+  /**
+   * The AssignVariableOp name that initializes the internal step counter.
+   * Pass this to globalVariablesInitializer() alongside other init ops so
+   * the step variable is properly initialized before the graph runs.
+   */
+  initOp: string;
+}
+
 /**
  * makeDropoutSeed — creates a counter-based int32 [2] seed tensor for dropout.
  *
@@ -244,7 +255,7 @@ export function makeDropoutSeed(
   g: Graph,
   layerId: number,
   name?: string,
-): Tensor {
+): DropoutSeedResult {
   const pfx = name ?? `dropout_seed_${layerId}`;
 
   // Step variable — int32 scalar, initialised to 0, incremented each step.
@@ -252,7 +263,7 @@ export function makeDropoutSeed(
   stepBuf.writeInt32LE(0, 0);
   const stepInit = constant(g, stepBuf, [], DType.INT32, `${pfx}/step_init`);
 
-  const { handle: stepHandle, initOp: _initOp } = variableWithInit(
+  const { handle: stepHandle, initOp } = variableWithInit(
     g,
     [],
     DType.INT32,
@@ -285,7 +296,7 @@ export function makeDropoutSeed(
     `${pfx}/seed`,
   );
 
-  return seed;
+  return { seed, initOp };
 }
 
 /**

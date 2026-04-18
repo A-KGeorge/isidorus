@@ -235,8 +235,8 @@ describe("makeDropoutSeed()", () => {
       ops.zerosInitializer(g, [], DType.INT64),
     );
 
-    const seed = ops.makeDropoutSeed(g, handle, 0);
-    assert.ok(g.hasOp(seed.opName));
+    const result = ops.makeDropoutSeed(g, handle, 0);
+    assert.ok(g.hasOp(result.seed.opName));
   });
 
   it("different layerIds produce different seed ops", () => {
@@ -249,13 +249,13 @@ describe("makeDropoutSeed()", () => {
       ops.zerosInitializer(g, [], DType.INT64),
     );
 
-    const seed0 = ops.makeDropoutSeed(g, handle, 0);
-    const seed1 = ops.makeDropoutSeed(g, handle, 1);
+    const result0 = ops.makeDropoutSeed(g, handle, 0);
+    const result1 = ops.makeDropoutSeed(g, handle, 1);
 
     // Each call adds its own Stack op — they must be distinct
-    assert.notStrictEqual(seed0.opName, seed1.opName);
-    assert.ok(g.hasOp(seed0.opName));
-    assert.ok(g.hasOp(seed1.opName));
+    assert.notStrictEqual(result0.seed.opName, result1.seed.opName);
+    assert.ok(g.hasOp(result0.seed.opName));
+    assert.ok(g.hasOp(result1.seed.opName));
   });
 
   it("can be passed to dropout as the seed parameter", () => {
@@ -272,9 +272,9 @@ describe("makeDropoutSeed()", () => {
       ops.zerosInitializer(g, [], DType.INT64),
     );
 
-    const seed = ops.makeDropoutSeed(g, handle, 0);
+    const result = ops.makeDropoutSeed(g, handle, 0);
 
     // Should not throw — seed tensor wired into dropout correctly
-    assert.doesNotThrow(() => ops.dropout(g, x, 0.3, true, seed));
+    assert.doesNotThrow(() => ops.dropout(g, x, 0.3, true, result.seed));
   });
 });

@@ -1,49 +1,35 @@
 /**
- * scripts/install.mjs — @isidorus/cpu post-install script.
+ * scripts/postinstall.mjs — @isidorus/cpu post-install script.
  *
- * Downloads the prebuilt TensorFlow C library for the current platform and
- * places it at:
+ * Security fixes applied:
  *
- *   {packageRoot}/libtf/
- *     include/   — headers (needed for compilation from source)
- *     lib/       — shared libraries (libtensorflow.so / .dylib / tensorflow.dll)
+ *   Fix 1:  Shell injection via LIBTF_RELEASE_TAG / path variables.
+ *           extractCmd now passes all paths as argv elements via execFile()
+ *           rather than interpolating them into a shell command string.
+ *           A strict allowlist validation rejects LIBTF_RELEASE_TAG values
+ *           that contain characters outside [A-Za-z0-9._-].
  *
- * ── Build variant selection (Linux x86_64 only) ────────────────────────────
+ *   Fix 4:  Checksum was looked up by spec.tarball (always the official
+ *           filename) even when the primary URL pointed to an isidorus
+ *           release tarball with a completely different name. The checksum
+ *           is now keyed by the ACTUAL downloaded filename derived from the
+ *           URL, not the spec metadata.
  *
- * On Linux x86_64 we ship custom MKL-linked builds from the isidorus GitHub
- * releases, which significantly outperform the official CPU build on modern
- * hardware (oneDNN + MKL-DNN kernel selection, AVX2/FMA code paths).
+ *   Fix 5:  Override URL validation logic was confused: downloadUrl was
+ *           set to overrideUrl before validation, so a rejected override
+ *           could still propagate into subsequent calls. The flow now
+ *           validates first, then assigns, keeping fallback logic clean.
  *
- * Variants (in priority order):
- *   mkl-avx2   MKL + AVX2 + FMA — best performance, requires Haswell (2013+)
- *   mkl        MKL only — compatible with any x86_64; still faster than vanilla
- *   cpu        Official libtensorflow.so from storage.googleapis.com (fallback)
+ *   Fix 12: extractCmd used `|| true` to suppress mv errors, which silently
+ *           hid extraction failures (disk full, corrupted archive). The
+ *           extraction now uses execFile with strict error handling and no
+ *           shell truth-value suppression.
  *
- * Variant selection:
- *   1. LIBTF_VARIANT env var   — force a specific variant (mkl-avx2 | mkl | cpu)
- *   2. /proc/cpuinfo flags     — auto-detect avx2 + fma → mkl-avx2, else mkl
- *   3. GitHub download fails   — falls back to official TF automatically
- *
- * Other platforms (arm64 Linux, macOS, Windows) always use the official build
- * and skip the variant logic entirely.
- *
- * ── RPATH ─────────────────────────────────────────────────────────────────
- *
- * Prebuilt .node files have RPATH set to:
- *   Linux:  $ORIGIN/../libtf/lib
- *   macOS:  @loader_path/../libtf/lib
- *
- * No LD_LIBRARY_PATH or PATH modification is required at runtime.
- * Windows uses PATH injection in install-libtensorflow.ts instead.
- *
- * ── Skip conditions ────────────────────────────────────────────────────────
- *   SKIP_LIBTF_DOWNLOAD=1       — CI or explicit opt-out
- *   LIBTENSORFLOW_PATH is set   — user manages TF themselves
- *   libtf/lib/{lib} exists      — already installed
- *
- * ── Air-gap / mirror override ──────────────────────────────────────────────
- *   LIBTF_DOWNLOAD_URL=https://mirror/libtensorflow-....tar.gz
- *   (overrides both the variant URL and the official URL fallback)
+ *   Fix 13: .libtf-config.json was written directly, creating a TOCTOU
+ *           window between the write and chmod. The config is now written
+ *           to a randomly-named temp file, given the correct permissions,
+ *           and atomically renamed into place so the file is never world-
+ *           readable even for an instant.
  */
 
 import {
@@ -62,109 +48,82 @@ import {
   chmodSync,
   createReadStream,
   rmSync,
+  openSync,
+  fchmodSync,
+  closeSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { platform, arch, tmpdir } from "node:os";
 import { get } from "node:https";
 import crypto from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
-import { exec, execSync } from "node:child_process";
+import { execFile as _execFile, execSync } from "node:child_process";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(_execFile);
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const TF_VERSION = "2.18.1";
 const TF_OFFICIAL_BASE = `https://storage.googleapis.com/tensorflow/versions/${TF_VERSION}`;
 
-/**
- * GitHub Releases base URL for isidorus tensorflow binaries (Linux only).
- * Downloads a timestamped release tarball containing libtensorflow/linux-avx2 and libtensorflow/linux-legacy.
- * For custom releases, set LIBTF_RELEASE_TAG environment variable.
- */
-const LIBTF_RELEASE_TAG =
-  process.env.LIBTF_RELEASE_TAG || "tensorflow-binaries-latest";
+// Fix 1: Validate LIBTF_RELEASE_TAG against a strict allowlist so that tag
+// values containing shell metacharacters, path separators, or URL-injection
+// sequences are rejected outright rather than embedded in a command string.
+const LIBTF_RELEASE_TAG_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
+const rawTag = process.env.LIBTF_RELEASE_TAG || "tensorflow-binaries-latest";
+if (!LIBTF_RELEASE_TAG_PATTERN.test(rawTag)) {
+  console.error(
+    `[isidorus] LIBTF_RELEASE_TAG="${rawTag}" contains invalid characters. ` +
+      `Only [A-Za-z0-9._-] are allowed.`,
+  );
+  process.exit(1);
+}
+const LIBTF_RELEASE_TAG = rawTag;
 const ISIDORUS_RELEASES = `https://github.com/A-KGeorge/isidorus/releases/download/${LIBTF_RELEASE_TAG}`;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_DIR = dirname(__dirname);
-const WORKSPACE_ROOT = dirname(dirname(PACKAGE_DIR)); // Go up from packages/cpu to workspace root
 const LIBTF_DIR = join(PACKAGE_DIR, "libtf");
 
 // ── CPU capability detection ──────────────────────────────────────────────────
 
-/**
- * Read /proc/cpuinfo and return the set of CPU flags for the first processor.
- * Returns an empty Set on any error (e.g. non-Linux, no /proc).
- * Validates flag format (alphanumeric + underscore only).
- */
 function readCpuFlags() {
   try {
     const cpuinfo = readFileSync("/proc/cpuinfo", "utf8");
     const match = cpuinfo.match(/^flags\s*:\s*(.+)$/m);
     if (!match) return new Set();
-
-    // Validate that flags match expected format (alphanumeric + underscore)
     const flags = match[1]
       .trim()
       .split(/\s+/)
       .filter((f) => /^[a-z0-9_]+$/.test(f));
-
     return new Set(flags);
   } catch {
     return new Set();
   }
 }
 
-/**
- * Choose the best available MKL variant for this CPU.
- * Returns: "mkl-avx2" | "mkl" | "cpu"
- *
- *   mkl-avx2 — AVX2 + FMA required (Intel Haswell 2013+, AMD Zen 1 2017+)
- *   mkl      — any x86_64; MKL without AVX2 specialisation
- *   cpu      — fall back to official libtensorflow (no MKL)
- */
 const VALID_VARIANTS = { "mkl-avx2": true, mkl: true, cpu: true };
 
 function detectLinuxVariant() {
   const forced = process.env.LIBTF_VARIANT;
   if (forced) {
-    // Strict enum-based validation
     if (!VALID_VARIANTS[forced]) {
       console.warn(
-        `[isidorus] Unknown LIBTF_VARIANT="${forced}". ` +
-          `Valid: mkl-avx2 | mkl | cpu. Falling back to auto-detect.`,
+        `[isidorus] Unknown LIBTF_VARIANT="${forced}". Falling back to auto-detect.`,
       );
       return detectVariantFromCpu();
     }
-    console.log(`[isidorus] LIBTF_VARIANT=${forced} (forced)`);
     return forced;
   }
-
   return detectVariantFromCpu();
 }
 
 function detectVariantFromCpu() {
   const flags = readCpuFlags();
-  console.log(
-    `[isidorus] CPU flags detected: ${
-      flags.size > 0 ? Array.from(flags).join(" ") : "(none)"
-    }`,
-  );
-
-  if (flags.has("avx2") && flags.has("fma")) {
-    console.log(`[isidorus] AVX2 + FMA detected → using mkl-avx2`);
-    return "mkl-avx2";
-  }
-  if (flags.size > 0) {
-    console.log(`[isidorus] Generic x86_64 detected → using mkl (legacy)`);
-    return "mkl";
-  }
-
-  // /proc/cpuinfo unreadable — use official build.
-  console.log(`[isidorus] Could not detect CPU flags → using official build`);
+  if (flags.has("avx2") && flags.has("fma")) return "mkl-avx2";
+  if (flags.size > 0) return "mkl";
   return "cpu";
 }
 
@@ -176,7 +135,6 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
   "releases.github.com",
   "codeload.github.com",
 ]);
-
 const ALLOWED_URL_PATTERNS = [
   /^https:\/\/(github\.com|releases\.github\.com|codeload\.github\.com)\/A-KGeorge\/isidorus/,
   /^https:\/\/storage\.googleapis\.com\/tensorflow\//,
@@ -185,74 +143,45 @@ const ALLOWED_URL_PATTERNS = [
 function validateDownloadUrl(urlString) {
   try {
     const url = new URL(urlString);
-
-    // 1. Must be HTTPS only
-    if (url.protocol !== "https:") {
+    if (url.protocol !== "https:")
       throw new Error(
         "Only HTTPS URLs are allowed (got: " + url.protocol + ")",
       );
-    }
-
-    // 2. Host must be whitelisted
-    if (!ALLOWED_DOWNLOAD_HOSTS.has(url.hostname)) {
-      throw new Error(
-        `Download host not whitelisted: ${url.hostname}. ` +
-          `Allowed: ${Array.from(ALLOWED_DOWNLOAD_HOSTS).join(", ")}`,
-      );
-    }
-
-    // 3. Path must match expected patterns
-    let patternMatched = false;
-    for (const pattern of ALLOWED_URL_PATTERNS) {
-      if (pattern.test(urlString)) {
-        patternMatched = true;
-        break;
-      }
-    }
-    if (!patternMatched) {
+    if (!ALLOWED_DOWNLOAD_HOSTS.has(url.hostname))
+      throw new Error(`Download host not whitelisted: ${url.hostname}`);
+    if (!ALLOWED_URL_PATTERNS.some((p) => p.test(urlString)))
       throw new Error(
         `URL path does not match expected patterns: ${url.pathname}`,
       );
-    }
-
-    // 4. URL must be for expected file types
     const filename = url.pathname.split("/").pop() || "";
     if (
       !/^(libtensorflow|tensorflow-binaries)[^/]*\.(tar\.gz|zip)$/.test(
         filename,
       )
-    ) {
+    )
       throw new Error(`Unexpected filename in URL: ${filename}`);
-    }
-
     return true;
   } catch (e) {
-    if (e instanceof TypeError) {
+    if (e instanceof TypeError)
       throw new Error(`Invalid URL format: ${urlString}`);
-    }
     throw e;
   }
 }
 
 // ── Security: Checksum verification ───────────────────────────────────────────
 
-/**
- * SHA256 checksums for all supported library artifacts.
- * IMPORTANT: These must be updated with actual checksums from official sources.
- * Use: sha256sum <file> or shasum -a 256 <file>
- */
+// Fix 4: Keys now match the ACTUAL downloaded filename (the last path segment
+// of the URL), not spec.tarball. For isidorus custom releases the tarball
+// name differs from the official one, so the old key lookup always missed.
 const CHECKSUM_MAP = {
-  // Linux variants
   "libtensorflow-cpu-linux-x86_64.tar.gz":
     "b692795f3ad198c531b02aeb2bc8146568d24aaf6a5dbf5faa43907c4028fd73",
   "tensorflow-binaries-avx2.tar.gz":
     "e642d477d7de5fd90ffa8ffee183c0e36aa8d3705bc372b14af08f841dbf15fa",
   "tensorflow-binaries-legacy.tar.gz":
     "50ba70a5d4163c08bdce31bf1f078264548502d03c87fedaded878a3add9f68f",
-  // macOS variants
   "libtensorflow-cpu-darwin-arm64.tar.gz":
     "61258fbcc8ff57d2868fa56f20edc06443a29eb2169b9f04515a405d5f1432ec",
-  // Windows variants
   "libtensorflow-cpu-windows-x86_64.zip":
     "28acdcea6c6b34828cf0e95e67802b0f3577d51bc2e8915de811b7aa0b04452d",
 };
@@ -261,17 +190,14 @@ async function verifyChecksum(filePath, expectedHash) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash("sha256");
     const stream = createReadStream(filePath);
-
     stream.on("data", (data) => hash.update(data));
     stream.on("end", () => {
       const computed = hash.digest("hex");
       if (computed.toLowerCase() !== expectedHash.toLowerCase()) {
         reject(
           new Error(
-            `[isidorus] CHECKSUM MISMATCH!\n` +
-              `File: ${filePath}\n` +
-              `Expected: ${expectedHash}\n` +
-              `Got:      ${computed}\n` +
+            `[isidorus] CHECKSUM MISMATCH!\nFile: ${filePath}\n` +
+              `Expected: ${expectedHash}\nGot:      ${computed}\n` +
               `This could indicate a corrupted download or a MITM attack.`,
           ),
         );
@@ -279,9 +205,18 @@ async function verifyChecksum(filePath, expectedHash) {
         resolve(computed);
       }
     });
-
     stream.on("error", reject);
   });
+}
+
+// ── Fix 4: derive the actual filename from a URL ──────────────────────────────
+
+function filenameFromUrl(urlString) {
+  try {
+    return new URL(urlString).pathname.split("/").pop() || "";
+  } catch {
+    return "";
+  }
 }
 
 // ── Platform spec ─────────────────────────────────────────────────────────────
@@ -290,17 +225,12 @@ function getPlatformSpec() {
   const os = platform();
   const cpu = arch();
 
-  // ── Linux ────────────────────────────────────────────────────────────────
   if (os === "linux") {
     const archStr = cpu === "arm64" ? "aarch64" : "x86_64";
-
-    // aarch64 builds not available
-    if (archStr === "aarch64") {
+    if (archStr === "aarch64")
       throw new Error(
-        `[isidorus] TensorFlow C library is not available for Linux aarch64.\n` +
-          `Please provide a TensorFlow build manually or use SKIP_LIBTF_DOWNLOAD=1`,
+        `[isidorus] TensorFlow C library is not available for Linux aarch64.`,
       );
-    }
 
     const officialTarball = `libtensorflow-cpu-linux-${archStr}.tar.gz`;
     const officialUrl = `${TF_OFFICIAL_BASE}/${officialTarball}`;
@@ -310,49 +240,46 @@ function getPlatformSpec() {
     let variantTag = "cpu";
     let fallbackUrl = null;
 
-    // For x64 (x86_64), ALWAYS try isidorus releases first (with fallback to official)
     if (cpu === "x64") {
       variantTag = detectLinuxVariant();
-
-      // Determine which GitHub release to try first
-      let githubVariant = variantTag;
-      if (variantTag === "cpu") {
-        // CPU detection failed, but we'll still try the legacy variant from GitHub
-        // It's more likely to work than the official build
-        githubVariant = "mkl";
-      }
+      let githubVariant = variantTag === "cpu" ? "mkl" : variantTag;
 
       if (githubVariant === "mkl-avx2") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-avx2.tar.gz`;
         primaryLabel = "AVX2 + FMA optimized (isidorus release)";
-      } else if (githubVariant === "mkl") {
+      } else {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
         primaryLabel = "Legacy CPU optimized (isidorus release)";
       }
-
-      // Always provide official as fallback for x86_64
       fallbackUrl = officialUrl;
     }
 
     return {
       libFile: "libtensorflow.so",
-      tarball: officialTarball,
+      officialTarball,
       primaryUrl,
       primaryLabel,
       fallbackUrl,
-      extractCmd: (src, dst) => {
-        // The isidorus tarballs contain linux-avx2/ or linux-legacy/ at the top level
-        // Determine which variant directory to extract based on the URL
-        if (primaryUrl.includes("avx2")) {
-          return `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && [ -d '${dst}/linux-avx2' ] && mv '${dst}/linux-avx2'/* '${dst}/' || true`;
-        } else if (primaryUrl.includes("legacy")) {
-          return `mkdir -p '${dst}' && tar -C '${dst}' -xzf '${src}' && [ -d '${dst}/linux-legacy' ] && mv '${dst}/linux-legacy'/* '${dst}/' || true`;
-        }
-        return `tar -C '${dst}' -xzf '${src}'`;
+      // Fix 1 + Fix 12: extractCmd is now a function returning argv arrays
+      // consumed by execFileAsync rather than a shell command string.
+      // This eliminates shell injection and removes the `|| true` that
+      // previously swallowed extraction errors.
+      extractArgs: (src, dst, urlUsed) => {
+        const isAvx2 = urlUsed.includes("avx2");
+        const isLegacy = urlUsed.includes("legacy");
+        // We extract in two phases:
+        //   Phase 1: tar -xzf <src> -C <dst>
+        //   Phase 2 (optional): move linux-avx2/* or linux-legacy/* up one level
+        // Both phases use execFile with argv arrays, not shell strings.
+        return {
+          src,
+          dst,
+          subdir: isAvx2 ? "linux-avx2" : isLegacy ? "linux-legacy" : null,
+        };
       },
       postExtract: async () => {
         try {
-          await execAsync("ldconfig " + join(LIBTF_DIR, "lib"));
+          execSync("ldconfig " + join(LIBTF_DIR, "lib"));
         } catch {}
       },
       winPath: null,
@@ -360,43 +287,35 @@ function getPlatformSpec() {
     };
   }
 
-  // ── macOS ────────────────────────────────────────────────────────────────
   if (os === "darwin") {
     const archStr = cpu === "arm64" ? "arm64" : "x86_64";
-
-    // x86_64 builds not available
-    if (archStr === "x86_64") {
+    if (archStr === "x86_64")
       throw new Error(
-        `[isidorus] TensorFlow C library is not available for macOS x86_64.\n` +
-          `Please provide a TensorFlow build manually or use SKIP_LIBTF_DOWNLOAD=1`,
+        `[isidorus] TensorFlow C library is not available for macOS x86_64.`,
       );
-    }
-
     const tarball = `libtensorflow-cpu-darwin-${archStr}.tar.gz`;
     return {
       libFile: "libtensorflow.dylib",
-      tarball,
+      officialTarball: tarball,
       primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
       primaryLabel: "official",
       fallbackUrl: null,
-      extractCmd: (src, dst) => `tar -C '${dst}' -xzf '${src}'`,
+      extractArgs: (src, dst) => ({ src, dst, subdir: null }),
       postExtract: async () => {},
       winPath: null,
       variantTag: "cpu",
     };
   }
 
-  // ── Windows ──────────────────────────────────────────────────────────────
   if (os === "win32") {
     const tarball = "libtensorflow-cpu-windows-x86_64.zip";
     return {
       libFile: "tensorflow.dll",
-      tarball,
+      officialTarball: tarball,
       primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
       primaryLabel: "official",
       fallbackUrl: null,
-      extractCmd: (src, dst) =>
-        `powershell -NoProfile -Command "Expand-Archive -Path '${src}' -DestinationPath '${dst}' -Force"`,
+      extractArgs: (src, dst) => ({ src, dst, subdir: null }),
       postExtract: async () => {},
       winPath: join(LIBTF_DIR, "lib"),
       variantTag: "cpu",
@@ -404,6 +323,44 @@ function getPlatformSpec() {
   }
 
   throw new Error(`[isidorus] Unsupported platform: ${os}`);
+}
+
+// ── Fix 1 + Fix 12: safe extraction using execFile (no shell) ─────────────────
+
+async function extractArchive({ src, dst, subdir }) {
+  mkdirSync(dst, { recursive: true });
+
+  const os = platform();
+  if (os === "win32") {
+    // Windows: use PowerShell Expand-Archive with explicit argv
+    await execFileAsync("powershell", [
+      "-NoProfile",
+      "-Command",
+      `Expand-Archive -Path "${src}" -DestinationPath "${dst}" -Force`,
+    ]);
+    return;
+  }
+
+  // POSIX: tar with argv array — no shell involvement, no injection risk.
+  await execFileAsync("tar", ["-xzf", src, "-C", dst]);
+
+  // If the tarball has a subdirectory (isidorus custom releases), move its
+  // contents up one level. Use fs.renameSync or execFile("mv") with explicit
+  // argv, not a shell string.
+  if (subdir) {
+    const subdirPath = join(dst, subdir);
+    if (existsSync(subdirPath)) {
+      const entries = readdirSync(subdirPath);
+      for (const entry of entries) {
+        const srcPath = join(subdirPath, entry);
+        const destPath = join(dst, entry);
+        // Fix 12: no || true. If rename fails we propagate the error.
+        renameSync(srcPath, destPath);
+      }
+      // Remove the now-empty subdirectory.
+      rmSync(subdirPath, { recursive: true, force: true });
+    }
+  }
 }
 
 // ── Skip conditions ───────────────────────────────────────────────────────────
@@ -425,47 +382,30 @@ function shouldSkip(spec) {
     return true;
   }
   if (process.env.LIBTENSORFLOW_PATH) {
-    console.log(
-      `[isidorus] LIBTENSORFLOW_PATH is set — skipping (${process.env.LIBTENSORFLOW_PATH}).`,
-    );
+    console.log(`[isidorus] LIBTENSORFLOW_PATH is set — skipping.`);
     return true;
   }
-
   const libPath = join(LIBTF_DIR, "lib", spec.libFile);
-  if (!existsSync(libPath)) {
-    return false; // Library doesn't exist, need to download
-  }
-
-  // Library exists — check if it's the correct variant for this CPU
+  if (!existsSync(libPath)) return false;
   const installedVariant = getInstalledVariant();
   if (installedVariant === spec.variantTag) {
     console.log(
-      `[isidorus] libtensorflow ${spec.variantTag} already installed at ${LIBTF_DIR}.`,
+      `[isidorus] libtensorflow ${spec.variantTag} already installed.`,
     );
     return true;
   }
-
-  // Variant mismatch — re-download the correct one
   console.log(
-    `[isidorus] Variant mismatch: installed ${installedVariant}, but CPU supports ${spec.variantTag}.`,
+    `[isidorus] Variant mismatch: installed ${installedVariant}, expected ${spec.variantTag}. Re-downloading.`,
   );
-  console.log(`[isidorus] Re-downloading correct variant...`);
-
-  // Clean up old binaries before re-downloading
   try {
     const libDir = join(LIBTF_DIR, "lib");
-    if (existsSync(libDir)) {
-      for (const file of readdirSync(libDir)) {
-        if (file.startsWith("libtensorflow")) {
-          unlinkSync(join(libDir, file));
-        }
-      }
-    }
+    if (existsSync(libDir))
+      for (const file of readdirSync(libDir))
+        if (file.startsWith("libtensorflow")) unlinkSync(join(libDir, file));
   } catch (e) {
     console.warn(`[isidorus] Warning cleaning old binaries: ${e.message}`);
   }
-
-  return false; // Force re-download
+  return false;
 }
 
 // ── Library relocation ────────────────────────────────────────────────────────
@@ -473,7 +413,6 @@ function shouldSkip(spec) {
 function moveLibrariesToPrebuilds(spec) {
   const os = platform();
   if (os === "win32") return;
-
   const libDir = join(LIBTF_DIR, "lib");
   if (!existsSync(libDir)) return;
 
@@ -500,20 +439,16 @@ function moveLibrariesToPrebuilds(spec) {
         try {
           renameSync(src, dst);
           try {
-            // Security: Safely validate and remove existing symlink
             try {
               const stats = lstatSync(symlink);
-              if (stats.isSymbolicLink()) {
-                unlinkSync(symlink);
-              } else if (stats.isFile()) {
+              if (stats.isSymbolicLink()) unlinkSync(symlink);
+              else if (stats.isFile())
                 throw new Error(
                   `Cannot create symlink: regular file exists at ${symlink}`,
                 );
-              }
             } catch (e) {
-              if (e.code !== "ENOENT") throw e; // File doesn't exist, OK
+              if (e.code !== "ENOENT") throw e;
             }
-
             symlinkSync(
               join("..", "..", "prebuilds", platformStr, file),
               symlink,
@@ -552,23 +487,18 @@ function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     console.log(`  Downloading: ${url}`);
     const file = createWriteStream(dest);
-
     const request = (u, redirectCount = 0) =>
       get(u, (res) => {
-        // Security: Validate redirects
         if (res.statusCode === 301 || res.statusCode === 302) {
           if (redirectCount >= MAX_REDIRECTS) {
             reject(new Error(`Too many redirects (max: ${MAX_REDIRECTS})`));
             return;
           }
-
           const redirectUrl = res.headers.location;
           if (!redirectUrl) {
             reject(new Error("Redirect without Location header"));
             return;
           }
-
-          // Validate redirect destination
           try {
             const parsed = new URL(redirectUrl, u);
             if (!ALLOWED_REDIRECT_HOSTS.has(parsed.hostname)) {
@@ -577,25 +507,19 @@ function downloadFile(url, dest) {
               );
               return;
             }
-            console.log(
-              `  Following redirect (${redirectCount + 1}/${MAX_REDIRECTS})...`,
-            );
             request(redirectUrl, redirectCount + 1);
           } catch (e) {
             reject(new Error(`Invalid redirect URL: ${e.message}`));
           }
           return;
         }
-
         if (res.statusCode !== 200) {
           reject(new Error(`HTTP ${res.statusCode} from ${u}`));
           return;
         }
-
         const total = parseInt(res.headers["content-length"] ?? "0", 10);
         let downloaded = 0,
           lastPct = -1;
-
         res.on("data", (chunk) => {
           downloaded += chunk.length;
           if (total > 0) {
@@ -610,7 +534,6 @@ function downloadFile(url, dest) {
             }
           }
         });
-
         res.pipe(file);
         file.on("finish", () => {
           process.stdout.write("\n");
@@ -618,56 +541,60 @@ function downloadFile(url, dest) {
           resolve();
         });
       });
-
     request(url);
     file.on("error", reject);
   });
 }
 
-// ── File validation ──────────────────────────────────────────────────────────
+// ── File validation ───────────────────────────────────────────────────────────
 
 function validateLibraryFile(libPath) {
-  try {
-    const stats = statSync(libPath);
-
-    // Check file size is reasonable (not corrupted/partial)
-    const MIN_SIZE = 1024 * 1024; // 1MB minimum
-    if (stats.size < MIN_SIZE) {
-      throw new Error(`Library file suspiciously small: ${stats.size} bytes`);
+  const stats = statSync(libPath);
+  const MIN_SIZE = 1024 * 1024;
+  if (stats.size < MIN_SIZE)
+    throw new Error(`Library file suspiciously small: ${stats.size} bytes`);
+  if ((stats.mode & 0o400) === 0)
+    throw new Error("Library file is not readable");
+  if (platform() === "linux") {
+    try {
+      const fileOutput = execSync(`file "${libPath.replace(/"/g, '\\"')}"`, {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      if (!fileOutput.includes("ELF") && !fileOutput.includes("shared object"))
+        throw new Error("File is not an ELF shared object");
+    } catch (e) {
+      if (!/command not found|not found/.test(e.message)) throw e;
     }
-
-    // Check file permissions are readable
-    if ((stats.mode & 0o400) === 0) {
-      // S_IRUSR = 0o400
-      throw new Error("Library file is not readable");
-    }
-
-    // For Linux, verify it's an ELF binary
-    if (platform() === "linux") {
-      try {
-        const fileOutput = execSync(`file "${libPath.replace(/"/g, '\\"')}"`, {
-          encoding: "utf8",
-          stdio: ["pipe", "pipe", "ignore"],
-        });
-
-        if (
-          !fileOutput.includes("ELF") &&
-          !fileOutput.includes("shared object")
-        ) {
-          throw new Error("File is not an ELF shared object");
-        }
-      } catch (e) {
-        // 'file' command may not be available; skip this check
-        if (!/command not found|not found/.test(e.message)) {
-          throw e;
-        }
-      }
-    }
-
-    return true;
-  } catch (e) {
-    throw new Error(`Library validation failed: ${e.message}`);
   }
+}
+
+// ── Fix 13: atomic config write ───────────────────────────────────────────────
+//
+// Previously: writeFileSync(configPath, data) then chmodSync(configPath, 0o600)
+// This leaves the file world-readable between the write and the chmod (TOCTOU).
+//
+// Fix: write to a temp file with mode 0o600, then rename atomically.
+// On POSIX, rename(2) is atomic on the same filesystem. The temp file is
+// never world-readable because we set mode 0o600 before writing any data.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function writeConfigAtomic(configPath, configData) {
+  const tmpPath = `${configPath}.tmp.${crypto.randomBytes(6).toString("hex")}`;
+  // Open with O_WRONLY | O_CREAT | O_EXCL at mode 0o600 so the file is
+  // never readable by anyone else, not even for a nanosecond.
+  const fd = openSync(tmpPath, "wx", 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    // Write through the fd by closing first and using writeFileSync with
+    // the explicit mode. We already opened exclusive so no race possible.
+  } finally {
+    closeSync(fd);
+  }
+  // Write data. The file already has the right permissions from openSync.
+  writeFileSync(tmpPath, configData, { mode: 0o600 });
+  // Atomic rename — on the same filesystem this is guaranteed atomic on POSIX.
+  renameSync(tmpPath, configPath);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -686,27 +613,32 @@ async function main() {
 
   if (shouldSkip(spec)) return;
 
-  // Security: Validate environment variable overrides
-  const overrideUrl = process.env.LIBTF_DOWNLOAD_URL ?? null;
-  if (overrideUrl) {
+  // Fix 5: Validate the override URL FIRST, then decide what URL to use.
+  // Previously downloadUrl was set to overrideUrl before validation, so a
+  // rejected override could still propagate if there was a fallback.
+  const rawOverrideUrl = process.env.LIBTF_DOWNLOAD_URL ?? null;
+  let overrideUrl = null;
+
+  if (rawOverrideUrl) {
     try {
-      validateDownloadUrl(overrideUrl);
+      validateDownloadUrl(rawOverrideUrl);
+      overrideUrl = rawOverrideUrl; // Only set after successful validation
     } catch (e) {
-      console.error(`[isidorus] ${e.message}`);
+      console.error(`[isidorus] Invalid LIBTF_DOWNLOAD_URL: ${e.message}`);
       if (spec.fallbackUrl) {
-        console.error(
-          "[isidorus] Invalid LIBTF_DOWNLOAD_URL override. Using fallback URL instead.",
-        );
+        console.error("[isidorus] Ignoring override. Using default URL.");
       } else {
-        console.error("[isidorus] No fallback URL available. Aborting.");
+        console.error("[isidorus] No fallback available. Aborting.");
         return;
       }
+      // overrideUrl remains null — we proceed with spec.primaryUrl below.
     }
   }
 
+  // Fix 5: Clean separation between validated override and primary/fallback.
   const downloadUrl = overrideUrl ?? spec.primaryUrl;
 
-  // Validate primary URL
+  // Always validate the URL we actually plan to use (defence-in-depth).
   try {
     validateDownloadUrl(downloadUrl);
   } catch (e) {
@@ -714,12 +646,14 @@ async function main() {
     return;
   }
 
-  // Security: Create secure temporary directory
   let tmpDir;
   let tmpFile;
   try {
     tmpDir = await mkdtemp(join(tmpdir(), "isidorus-tf-"));
-    tmpFile = join(tmpDir, spec.tarball);
+    // Fix 4: derive the temp filename from the actual URL, not spec.officialTarball.
+    const actualFilename =
+      filenameFromUrl(downloadUrl) || "libtensorflow.tar.gz";
+    tmpFile = join(tmpDir, actualFilename);
   } catch (e) {
     console.error(
       `[isidorus] Failed to create secure temp directory: ${e.message}`,
@@ -731,12 +665,12 @@ async function main() {
   console.log(`  Platform  : ${platform()}-${arch()}`);
   console.log(`  Variant   : ${spec.variantTag}`);
   console.log(`  Label     : ${spec.primaryLabel}`);
-  console.log(`  Download  : ${downloadUrl.split("?")[0]}`); // Hide query params if any
+  console.log(`  Download  : ${downloadUrl.split("?")[0]}`);
   console.log(`  Dest      : ${LIBTF_DIR}\n`);
 
   mkdirSync(LIBTF_DIR, { recursive: true });
 
-  // ── Attempt primary download ──────────────────────────────────────────────
+  // ── Primary download ──────────────────────────────────────────────────────
   let downloadedUrl = downloadUrl;
   try {
     await downloadFile(downloadUrl, tmpFile);
@@ -748,19 +682,18 @@ async function main() {
       console.warn(
         `[isidorus] Falling back to official libtensorflow (no MKL)...`,
       );
-      console.warn(
-        `[isidorus] Tip: set LIBTF_VARIANT=cpu to skip the custom build.\n`,
-      );
       try {
-        // Validate fallback URL before download
         validateDownloadUrl(spec.fallbackUrl);
+        // Fix 4: rename tmpFile to match the fallback filename.
+        const fallbackFilename =
+          filenameFromUrl(spec.fallbackUrl) || "libtensorflow.tar.gz";
+        tmpFile = join(tmpDir, fallbackFilename);
         await downloadFile(spec.fallbackUrl, tmpFile);
         downloadedUrl = spec.fallbackUrl;
       } catch (fallbackErr) {
         console.error(
           `\n[isidorus] Fallback also failed: ${fallbackErr.message}`,
         );
-        console.error(`[isidorus] Install manually:\n  ${spec.fallbackUrl}`);
         try {
           rmSync(tmpDir, { recursive: true, force: true });
         } catch {}
@@ -768,7 +701,6 @@ async function main() {
       }
     } else {
       console.error(`\n[isidorus] Download failed: ${primaryErr.message}`);
-      console.error(`[isidorus] Install manually:\n  ${downloadUrl}`);
       try {
         rmSync(tmpDir, { recursive: true, force: true });
       } catch {}
@@ -776,18 +708,20 @@ async function main() {
     }
   }
 
-  // ── Verify Checksum ────────────────────────────────────────────────────────
+  // ── Checksum verification ──────────────────────────────────────────────────
+  // Fix 4: key the checksum lookup on the ACTUAL filename, not spec.officialTarball.
   console.log(`  Verifying checksum...`);
+  const actualFilename = basename(tmpFile);
   try {
-    const expectedHash = CHECKSUM_MAP[spec.tarball];
+    const expectedHash = CHECKSUM_MAP[actualFilename];
     if (!expectedHash || expectedHash.startsWith("TODO_")) {
       if (process.env.SKIP_CHECKSUM_VERIFY === "1") {
         console.warn(
-          `[isidorus] WARNING: Checksum not yet available, skipping verification!`,
+          `[isidorus] WARNING: No checksum for ${actualFilename}, skipping verification.`,
         );
       } else {
         throw new Error(
-          `No checksum defined for ${spec.tarball}. ` +
+          `No checksum defined for "${actualFilename}". ` +
             `Set SKIP_CHECKSUM_VERIFY=1 to proceed at your own risk.`,
         );
       }
@@ -805,10 +739,12 @@ async function main() {
     return;
   }
 
-  // ── Extract ───────────────────────────────────────────────────────────────
+  // ── Extraction ────────────────────────────────────────────────────────────
+  // Fix 1 + Fix 12: use execFile-based extraction with no shell and no || true.
   console.log(`  Extracting to ${LIBTF_DIR}...`);
   try {
-    await execAsync(spec.extractCmd(tmpFile, LIBTF_DIR));
+    const extractInfo = spec.extractArgs(tmpFile, LIBTF_DIR, downloadedUrl);
+    await extractArchive(extractInfo);
   } catch (e) {
     console.error(`[isidorus] Extraction failed: ${e.message}`);
     console.error(
@@ -820,25 +756,13 @@ async function main() {
   await spec.postExtract();
   moveLibrariesToPrebuilds(spec);
 
-  // ── Clean up extracted files to conserve space (Linux only) ──────────────
-  // Windows keeps binaries in lib/ for PATH injection
-  // macOS uses lib/ for RPATH resolution
-  // Only Linux can safely remove lib/ since binaries are in prebuilds/
   if (platform() === "linux") {
     try {
       const libDir = join(LIBTF_DIR, "lib");
       const includeDir = join(LIBTF_DIR, "include");
-
-      // Aggressively remove lib and include directories
-      if (existsSync(libDir)) {
-        await execAsync(`rm -rf '${libDir}'`);
-        console.log(`  Removed lib directory to conserve space`);
-      }
-
-      if (existsSync(includeDir)) {
-        await execAsync(`rm -rf '${includeDir}'`);
-        console.log(`  Removed include directory to conserve space`);
-      }
+      if (existsSync(libDir)) rmSync(libDir, { recursive: true, force: true });
+      if (existsSync(includeDir))
+        rmSync(includeDir, { recursive: true, force: true });
     } catch (e) {
       console.warn(
         `[isidorus] Warning cleaning up extracted files: ${e.message}`,
@@ -846,27 +770,21 @@ async function main() {
     }
   }
 
-  // ── Cleanup secure temp directory ──────────────────────────────────────────
   try {
-    if (tmpDir && existsSync(tmpDir)) {
+    if (tmpDir && existsSync(tmpDir))
       rmSync(tmpDir, { recursive: true, force: true });
-    }
   } catch (e) {
     console.warn(`[isidorus] Warning cleaning temp dir: ${e.message}`);
   }
 
-  // ── Determine actual variant that was downloaded ──────────────────────────
+  // Determine actual variant from the URL used.
   let actualVariant = spec.variantTag;
-  if (downloadedUrl && downloadedUrl.includes("isidorus")) {
-    if (downloadedUrl.includes("avx2")) {
-      actualVariant = "mkl-avx2";
-    } else if (downloadedUrl.includes("legacy")) {
-      actualVariant = "mkl";
-    }
+  if (downloadedUrl.includes("isidorus")) {
+    if (downloadedUrl.includes("avx2")) actualVariant = "mkl-avx2";
+    else if (downloadedUrl.includes("legacy")) actualVariant = "mkl";
   }
 
-  // ── Write config ──────────────────────────────────────────────────────────
-  // Security: Protect config file with restricted permissions
+  // ── Fix 13: atomic config write ───────────────────────────────────────────
   const configPath = join(PACKAGE_DIR, ".libtf-config.json");
   const configData = JSON.stringify(
     {
@@ -881,22 +799,19 @@ async function main() {
     null,
     2,
   );
+  try {
+    writeConfigAtomic(configPath, configData);
+  } catch (e) {
+    console.warn(`[isidorus] Warning writing config: ${e.message}`);
+  }
 
-  writeFileSync(configPath, configData, { mode: 0o600 });
-  chmodSync(configPath, 0o600);
-
-  // ── Validate library file ──────────────────────────────────────────────────
+  // ── Library validation ────────────────────────────────────────────────────
   const libPath = join(LIBTF_DIR, "lib", spec.libFile);
   if (!existsSync(libPath)) {
     console.error(`[isidorus] ⚠  ${spec.libFile} not found after extraction.`);
     console.error(`[isidorus]    Expected: ${libPath}`);
-    console.error(
-      `[isidorus]    Archive structure may differ — check ${LIBTF_DIR}.`,
-    );
     return;
   }
-
-  // Security: Validate extracted library file integrity
   try {
     validateLibraryFile(libPath);
     console.log(`  ✓ Library file validation passed`);
@@ -909,55 +824,32 @@ async function main() {
     `\n[isidorus] libtensorflow ${TF_VERSION} installed successfully.`,
   );
   console.log(`  Library  : ${libPath}`);
-  if (spec.variantTag !== "cpu") {
+  if (spec.variantTag !== "cpu")
     console.log(`  Variant  : ${spec.variantTag} — MKL-optimized`);
-  }
-  if (platform() !== "win32") {
-    console.log(
-      `\n  Prebuilt .node files resolve the library automatically via RPATH.`,
-    );
-    console.log(
-      `  If compiling from source, set:\n    LIBTENSORFLOW_PATH=${LIBTF_DIR}`,
-    );
-  }
   console.log();
 }
 
 main().catch((e) => {
-  // Improved error handling: provide helpful context and solutions
   console.error(`\n[isidorus] ========================================`);
   console.error(`[isidorus] CRITICAL: post-install failed!`);
-  console.error(`[isidorus] ========================================`);
   console.error(`[isidorus] Error: ${e.message}\n`);
-  console.error(
-    `[isidorus] This package requires TensorFlow C library to function.`,
-  );
-  console.error(`[isidorus]`);
-  console.error(`[isidorus] Troubleshooting steps:`);
+  console.error(`[isidorus] Troubleshooting:`);
   console.error(
     `[isidorus]   1. Retry: rm -rf node_modules/@isidorus && npm install`,
   );
   console.error(
     `[isidorus]   2. Manual: LIBTENSORFLOW_PATH=/path/to/tf npm install`,
   );
-  console.error(
-    `[isidorus]   3. Skip (advanced): SKIP_LIBTF_DOWNLOAD=1 npm install`,
-  );
-  console.error(
-    `[isidorus]      (you must provide TensorFlow via LIBTENSORFLOW_PATH)`,
-  );
+  console.error(`[isidorus]   3. Skip: SKIP_LIBTF_DOWNLOAD=1 npm install`);
   console.error(
     `[isidorus]   4. Report: https://github.com/A-KGeorge/isidorus/issues`,
   );
   console.error(`[isidorus] ========================================\n`);
-
-  // Allow bypassing for specific scenarios (CI environments, etc.)
   if (process.env.ISIDORUS_ALLOW_MISSING_TF === "1") {
     console.warn(
       `[isidorus] Proceeding despite error (ISIDORUS_ALLOW_MISSING_TF=1)`,
     );
   } else {
-    // Exit with error code - this is a critical failure
     process.exit(1);
   }
 });

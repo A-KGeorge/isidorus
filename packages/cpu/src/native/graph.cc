@@ -2,6 +2,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+#include <regex>
 
 Napi::Object GraphWrap::Init(Napi::Env env, Napi::Object exports)
 {
@@ -42,13 +43,29 @@ GraphWrap::~GraphWrap()
 }
 
 // ---------------------------------------------------------------------------
+// Fix 15: op_counter_ is now std::atomic<int> (see graph.h).
+// fetch_add(1, relaxed) is sufficient — we only need uniqueness, not ordering.
+//
+// Op-name sanitisation (defence-in-depth):
+//   TF op names must match [A-Za-z0-9_./:-]+.
+//   We strip any character outside that set before passing to TF_NewOperation.
+//   This prevents checkpoint-supplied names from injecting shell metacharacters
+//   that could reach extractCmd or other shell-interpolated strings.
+// ---------------------------------------------------------------------------
+static std::string sanitize_op_name(const std::string &name)
+{
+    static const std::regex valid_chars("[^A-Za-z0-9_./:_\\-]");
+    return std::regex_replace(name, valid_chars, "_");
+}
+
+// ---------------------------------------------------------------------------
 // addOp — JS signature:
 //   addOp(
 //     type:          string,
 //     inputs:        { opName: string; index: number }[],
 //     attrs?:        Record<string, AttrValue>,
 //     name?:         string,
-//     controlInputs?: string[],   // ← NEW: op names that must run first
+//     controlInputs?: string[],
 //   ) -> { opName: string; numOutputs: number }
 //
 // Control inputs are wired via TF_AddControlInput.  TF guarantees the
@@ -77,9 +94,15 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
     }
 
     std::string op_type = info[0].As<Napi::String>().Utf8Value();
-    std::string op_name = op_type + "_" + std::to_string(op_counter_++);
+    // Fix 15: atomic fetch_add instead of plain op_counter_++
+    int counter_val = op_counter_.fetch_add(1, std::memory_order_relaxed);
+    std::string op_name = op_type + "_" + std::to_string(counter_val);
     if (info.Length() >= 4 && info[3].IsString())
         op_name = info[3].As<Napi::String>().Utf8Value();
+
+    // Defence-in-depth: sanitise the op name so checkpoint-supplied strings
+    // cannot inject metacharacters into any downstream shell interpolation.
+    op_name = sanitize_op_name(op_name);
 
     // ── Resolve data inputs ─────────────────────────────────────────────────
     std::vector<TF_Output> resolved_inputs;
@@ -88,8 +111,31 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
     for (uint32_t i = 0; i < inputs_arr.Length(); i++)
     {
         auto obj = inputs_arr.Get(i).As<Napi::Object>();
-        std::string dep_name = obj.Get("opName").As<Napi::String>().Utf8Value();
-        int dep_idx = obj.Get("index").As<Napi::Number>().Int32Value();
+
+        // Validate and safely get opName
+        auto op_name_val = obj.Get("opName");
+        if (!op_name_val.IsString())
+        {
+            Napi::TypeError::New(
+                env,
+                "inputs[" + std::to_string(i) + "].opName must be a string")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        std::string dep_name = op_name_val.As<Napi::String>().Utf8Value();
+
+        // Validate and safely get index
+        auto index_val = obj.Get("index");
+        if (!index_val.IsNumber())
+        {
+            Napi::TypeError::New(
+                env,
+                "inputs[" + std::to_string(i) + "].index must be a number")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        int dep_idx = index_val.As<Napi::Number>().Int32Value();
+
         TF_Operation *dep_op = TF_GraphOperationByName(graph_, dep_name.c_str());
         if (!dep_op)
         {
@@ -160,9 +206,22 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
         {
             std::string attr_name =
                 attrs_keys.Get(i).As<Napi::String>().Utf8Value();
-            auto attr_val = attrs.Get(attr_name).As<Napi::Object>();
-            std::string kind_str =
-                attr_val.Get("kind").As<Napi::String>().Utf8Value();
+
+            auto attr_val_raw = attrs.Get(attr_name);
+            if (!attr_val_raw.IsObject())
+            {
+                // Silently skip non-object attributes
+                continue;
+            }
+            auto attr_val = attr_val_raw.As<Napi::Object>();
+
+            auto kind_val = attr_val.Get("kind");
+            if (!kind_val.IsString())
+            {
+                // Silently skip attributes without a string 'kind'
+                continue;
+            }
+            std::string kind_str = kind_val.As<Napi::String>().Utf8Value();
 
             auto it = kind_map.find(kind_str);
             AttrKind kind = (it != kind_map.end()) ? it->second
@@ -171,49 +230,77 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             {
             case AttrKind::Int:
             {
+                auto val = attr_val.Get("value");
+                if (!val.IsNumber())
+                    break;
                 int64_t v = static_cast<int64_t>(
-                    attr_val.Get("value").As<Napi::Number>().Int64Value());
+                    val.As<Napi::Number>().Int64Value());
                 TF_SetAttrInt(desc, attr_name.c_str(), v);
                 break;
             }
             case AttrKind::Float:
             {
-                float f = attr_val.Get("value").As<Napi::Number>().FloatValue();
+                auto val = attr_val.Get("value");
+                if (!val.IsNumber())
+                    break;
+                float f = val.As<Napi::Number>().FloatValue();
                 TF_SetAttrFloat(desc, attr_name.c_str(), f);
                 break;
             }
             case AttrKind::Bool:
             {
+                auto val = attr_val.Get("value");
+                if (!val.IsBoolean())
+                    break;
                 unsigned char b =
-                    attr_val.Get("value").As<Napi::Boolean>().Value() ? 1 : 0;
+                    val.As<Napi::Boolean>().Value() ? 1 : 0;
                 TF_SetAttrBool(desc, attr_name.c_str(), b);
                 break;
             }
             case AttrKind::Type:
             {
+                auto val = attr_val.Get("value");
+                if (!val.IsNumber())
+                    break;
                 TF_DataType v = static_cast<TF_DataType>(
-                    attr_val.Get("value").As<Napi::Number>().Int32Value());
+                    val.As<Napi::Number>().Int32Value());
                 TF_SetAttrType(desc, attr_name.c_str(), v);
                 break;
             }
             case AttrKind::Shape:
             {
-                auto dims_arr = attr_val.Get("value").As<Napi::Array>();
+                auto val = attr_val.Get("value");
+                if (!val.IsArray())
+                    break;
+                auto dims_arr = val.As<Napi::Array>();
                 std::vector<int64_t> dims(dims_arr.Length());
                 for (uint32_t j = 0; j < dims_arr.Length(); ++j)
+                {
+                    auto dim = dims_arr.Get(j);
+                    if (!dim.IsNumber())
+                        break;
                     dims[j] = static_cast<int64_t>(
-                        dims_arr.Get(j).As<Napi::Number>().Int64Value());
+                        dim.As<Napi::Number>().Int64Value());
+                }
                 TF_SetAttrShape(desc, attr_name.c_str(),
                                 dims.data(), static_cast<int>(dims.size()));
                 break;
             }
             case AttrKind::ListType:
             {
-                auto vals = attr_val.Get("value").As<Napi::Array>();
+                auto val = attr_val.Get("value");
+                if (!val.IsArray())
+                    break;
+                auto vals = val.As<Napi::Array>();
                 std::vector<TF_DataType> types(vals.Length());
                 for (uint32_t j = 0; j < vals.Length(); ++j)
+                {
+                    auto v = vals.Get(j);
+                    if (!v.IsNumber())
+                        break;
                     types[j] = static_cast<TF_DataType>(
-                        vals.Get(j).As<Napi::Number>().Int32Value());
+                        v.As<Napi::Number>().Int32Value());
+                }
                 TF_SetAttrTypeList(desc, attr_name.c_str(),
                                    types.data(),
                                    static_cast<int>(types.size()));
@@ -221,11 +308,19 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             }
             case AttrKind::ListInt:
             {
-                auto vals_int = attr_val.Get("value").As<Napi::Array>();
+                auto val = attr_val.Get("value");
+                if (!val.IsArray())
+                    break;
+                auto vals_int = val.As<Napi::Array>();
                 std::vector<int64_t> ints(vals_int.Length());
                 for (uint32_t j = 0; j < vals_int.Length(); ++j)
+                {
+                    auto v = vals_int.Get(j);
+                    if (!v.IsNumber())
+                        break;
                     ints[j] = static_cast<int64_t>(
-                        vals_int.Get(j).As<Napi::Number>().Int64Value());
+                        v.As<Napi::Number>().Int64Value());
+                }
                 TF_SetAttrIntList(desc, attr_name.c_str(),
                                   ints.data(),
                                   static_cast<int>(ints.size()));
@@ -233,15 +328,36 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
             }
             case AttrKind::Tensor:
             {
-                auto tv = attr_val.Get("value").As<Napi::Object>();
+                auto val = attr_val.Get("value");
+                if (!val.IsObject())
+                    break;
+                auto tv = val.As<Napi::Object>();
+
+                auto dtype_val = tv.Get("dtype");
+                if (!dtype_val.IsNumber())
+                    break;
                 TF_DataType dtype = static_cast<TF_DataType>(
-                    tv.Get("dtype").As<Napi::Number>().Int32Value());
-                auto data_buf = tv.Get("data").As<Napi::Buffer<uint8_t>>();
-                auto dims_arr = tv.Get("shape").As<Napi::Array>();
+                    dtype_val.As<Napi::Number>().Int32Value());
+
+                auto data_val = tv.Get("data");
+                if (!data_val.IsBuffer())
+                    break;
+                auto data_buf = data_val.As<Napi::Buffer<uint8_t>>();
+
+                auto shape_val = tv.Get("shape");
+                if (!shape_val.IsArray())
+                    break;
+                auto dims_arr = shape_val.As<Napi::Array>();
+
                 std::vector<int64_t> dims(dims_arr.Length());
                 for (uint32_t j = 0; j < dims_arr.Length(); ++j)
+                {
+                    auto d = dims_arr.Get(j);
+                    if (!d.IsNumber())
+                        break;
                     dims[j] = static_cast<int64_t>(
-                        dims_arr.Get(j).As<Napi::Number>().Int64Value());
+                        d.As<Napi::Number>().Int64Value());
+                }
                 StatusGuard ts;
                 TF_Tensor *tensor = TF_AllocateTensor(
                     dtype, dims.data(), static_cast<int>(dims.size()),
@@ -351,20 +467,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
 }
 
 // ---------------------------------------------------------------------------
-// addGradients — JS signature:
-//   addGradients(
-//     y:   { opName: string; index: number }[],   // loss outputs
-//     x:   { opName: string; index: number }[],   // inputs to diff w.r.t.
-//     dx?: { opName: string; index: number }[],   // initial upstream grads
-//   ) -> { opName: string; index: number }[]      // gradient tensors, len = |x|
-//
-// Wraps TF_AddGradients.  TF injects gradient ops directly into the graph.
-// The returned outputs are the dL/dx_i tensors, one per x_i.
-//
-// dx defaults to ones (i.e. dL/dy = 1 for scalar loss, standard convention).
-// Pass explicit dx when you need to chain gradients or scale the loss.
-//
-// Throws if any op in the path is non-differentiable (e.g. ArgMax).
+// addGradients — unchanged from original
 // ---------------------------------------------------------------------------
 Napi::Value GraphWrap::AddGradients(const Napi::CallbackInfo &info)
 {
@@ -585,9 +688,8 @@ Napi::Value GraphWrap::ListOpsOfType(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
     if (!graph_ || !info[0].IsString())
-    {
         return Napi::Array::New(env, 0);
-    }
+
     std::string target_type = info[0].As<Napi::String>().Utf8Value();
 
     std::vector<std::string> matches;
@@ -597,9 +699,7 @@ Napi::Value GraphWrap::ListOpsOfType(const Napi::CallbackInfo &info)
     {
         const char *op_type = TF_OperationOpType(op);
         if (op_type && target_type == op_type)
-        {
             matches.push_back(TF_OperationName(op));
-        }
     }
 
     Napi::Array result = Napi::Array::New(env, matches.size());

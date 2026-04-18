@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 
 // ----------------------------------------------------------------------------
@@ -62,6 +63,10 @@ AffinityMask affinity_mask_numa_node(int numa_node);
 // Build  a mask covering all online cores.
 AffinityMask affinity_mask_all();
 
+// Maximum number of completion items allowed in the native queue before
+// rejecting new runAsync requests to prevent unbounded memory growth.
+static constexpr size_t MAX_NATIVE_COMPLETION_QUEUE = 512;
+
 // ----------------------------------------------------------------------------
 // SessionWrap
 // ----------------------------------------------------------------------------
@@ -80,6 +85,9 @@ public:
 public:
     // Public for SessionCompletionCallJs (static fn, no friend access).
     // Not part of the JS-visible API.
+
+    std::atomic<bool> destroyed_{false};
+    std::atomic<int> in_flight_count_{0};
     napi_threadsafe_function completion_tsfn_ = nullptr;
     std::mutex completion_mu_;
     std::vector<struct CompletionData *> completion_queue_;
