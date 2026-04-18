@@ -324,7 +324,9 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo &info)
         for (int i = 0; i < total_cores; ++i)
             if (full_affinity_mask_ & (AffinityMask(1) << i))
                 ++online;
-        int tf_cores = std::max(1, online - reserve_cores);
+        int tf_cores = online - reserve_cores;
+        if (tf_cores < 1)
+            tf_cores = 1;
         AffinityMask tf_mask = 0;
         int assigned = 0;
         for (int i = total_cores - 1; i >= 0 && assigned < tf_cores; --i)
