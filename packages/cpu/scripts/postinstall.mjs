@@ -235,12 +235,14 @@ function getPlatformSpec() {
     const officialTarball = `libtensorflow-cpu-linux-${archStr}.tar.gz`;
     const officialUrl = `${TF_OFFICIAL_BASE}/${officialTarball}`;
 
+    // Start with GitHub releases as primary for x64 (Intel/AMD)
     let primaryUrl = officialUrl;
     let primaryLabel = "official";
     let variantTag = "cpu";
     let fallbackUrl = null;
 
     if (cpu === "x64") {
+      // Detect CPU capabilities and select optimized variant
       variantTag = detectLinuxVariant();
       let githubVariant = variantTag === "cpu" ? "mkl" : variantTag;
 
@@ -251,6 +253,7 @@ function getPlatformSpec() {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
         primaryLabel = "Legacy CPU optimized (isidorus release)";
       }
+      // Set official as fallback if GitHub releases unavailable
       fallbackUrl = officialUrl;
     }
 
