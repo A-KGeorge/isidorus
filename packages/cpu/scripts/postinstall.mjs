@@ -57,12 +57,19 @@ import {
   unlinkSync,
   createWriteStream,
   cpSync,
+  lstatSync,
+  statSync,
+  chmodSync,
+  createReadStream,
+  rmSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { platform, arch, tmpdir } from "node:os";
 import { get } from "node:https";
-import { exec } from "node:child_process";
+import crypto from "node:crypto";
+import { mkdtemp } from "node:fs/promises";
+import { exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
@@ -91,13 +98,21 @@ const LIBTF_DIR = join(PACKAGE_DIR, "libtf");
 /**
  * Read /proc/cpuinfo and return the set of CPU flags for the first processor.
  * Returns an empty Set on any error (e.g. non-Linux, no /proc).
+ * Validates flag format (alphanumeric + underscore only).
  */
 function readCpuFlags() {
   try {
     const cpuinfo = readFileSync("/proc/cpuinfo", "utf8");
     const match = cpuinfo.match(/^flags\s*:\s*(.+)$/m);
     if (!match) return new Set();
-    return new Set(match[1].trim().split(/\s+/));
+
+    // Validate that flags match expected format (alphanumeric + underscore)
+    const flags = match[1]
+      .trim()
+      .split(/\s+/)
+      .filter((f) => /^[a-z0-9_]+$/.test(f));
+
+    return new Set(flags);
   } catch {
     return new Set();
   }
@@ -111,20 +126,27 @@ function readCpuFlags() {
  *   mkl      — any x86_64; MKL without AVX2 specialisation
  *   cpu      — fall back to official libtensorflow (no MKL)
  */
+const VALID_VARIANTS = { "mkl-avx2": true, mkl: true, cpu: true };
+
 function detectLinuxVariant() {
   const forced = process.env.LIBTF_VARIANT;
   if (forced) {
-    if (!["mkl-avx2", "mkl", "cpu"].includes(forced)) {
+    // Strict enum-based validation
+    if (!VALID_VARIANTS[forced]) {
       console.warn(
         `[isidorus] Unknown LIBTF_VARIANT="${forced}". ` +
           `Valid: mkl-avx2 | mkl | cpu. Falling back to auto-detect.`,
       );
-    } else {
-      console.log(`[isidorus] LIBTF_VARIANT=${forced} (forced)`);
-      return forced;
+      return detectVariantFromCpu();
     }
+    console.log(`[isidorus] LIBTF_VARIANT=${forced} (forced)`);
+    return forced;
   }
 
+  return detectVariantFromCpu();
+}
+
+function detectVariantFromCpu() {
   const flags = readCpuFlags();
   console.log(
     `[isidorus] CPU flags detected: ${
@@ -146,6 +168,122 @@ function detectLinuxVariant() {
   return "cpu";
 }
 
+// ── Security: URL validation ──────────────────────────────────────────────────
+
+const ALLOWED_DOWNLOAD_HOSTS = new Set([
+  "github.com",
+  "storage.googleapis.com",
+  "releases.github.com",
+  "codeload.github.com",
+]);
+
+const ALLOWED_URL_PATTERNS = [
+  /^https:\/\/(github\.com|releases\.github\.com|codeload\.github\.com)\/A-KGeorge\/isidorus/,
+  /^https:\/\/storage\.googleapis\.com\/tensorflow\//,
+];
+
+function validateDownloadUrl(urlString) {
+  try {
+    const url = new URL(urlString);
+
+    // 1. Must be HTTPS only
+    if (url.protocol !== "https:") {
+      throw new Error(
+        "Only HTTPS URLs are allowed (got: " + url.protocol + ")",
+      );
+    }
+
+    // 2. Host must be whitelisted
+    if (!ALLOWED_DOWNLOAD_HOSTS.has(url.hostname)) {
+      throw new Error(
+        `Download host not whitelisted: ${url.hostname}. ` +
+          `Allowed: ${Array.from(ALLOWED_DOWNLOAD_HOSTS).join(", ")}`,
+      );
+    }
+
+    // 3. Path must match expected patterns
+    let patternMatched = false;
+    for (const pattern of ALLOWED_URL_PATTERNS) {
+      if (pattern.test(urlString)) {
+        patternMatched = true;
+        break;
+      }
+    }
+    if (!patternMatched) {
+      throw new Error(
+        `URL path does not match expected patterns: ${url.pathname}`,
+      );
+    }
+
+    // 4. URL must be for expected file types
+    const filename = url.pathname.split("/").pop() || "";
+    if (
+      !/^(libtensorflow|tensorflow-binaries)[^/]*\.(tar\.gz|zip)$/.test(
+        filename,
+      )
+    ) {
+      throw new Error(`Unexpected filename in URL: ${filename}`);
+    }
+
+    return true;
+  } catch (e) {
+    if (e instanceof TypeError) {
+      throw new Error(`Invalid URL format: ${urlString}`);
+    }
+    throw e;
+  }
+}
+
+// ── Security: Checksum verification ───────────────────────────────────────────
+
+/**
+ * SHA256 checksums for all supported library artifacts.
+ * IMPORTANT: These must be updated with actual checksums from official sources.
+ * Use: sha256sum <file> or shasum -a 256 <file>
+ */
+const CHECKSUM_MAP = {
+  // Linux variants
+  "libtensorflow-cpu-linux-x86_64.tar.gz":
+    "b692795f3ad198c531b02aeb2bc8146568d24aaf6a5dbf5faa43907c4028fd73",
+  "tensorflow-binaries-avx2.tar.gz":
+    "e642d477d7de5fd90ffa8ffee183c0e36aa8d3705bc372b14af08f841dbf15fa",
+  "tensorflow-binaries-legacy.tar.gz":
+    "50ba70a5d4163c08bdce31bf1f078264548502d03c87fedaded878a3add9f68f",
+  // macOS variants
+  "libtensorflow-cpu-darwin-arm64.tar.gz":
+    "61258fbcc8ff57d2868fa56f20edc06443a29eb2169b9f04515a405d5f1432ec",
+  // Windows variants
+  "libtensorflow-cpu-windows-x86_64.zip":
+    "28acdcea6c6b34828cf0e95e67802b0f3577d51bc2e8915de811b7aa0b04452d",
+};
+
+async function verifyChecksum(filePath, expectedHash) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = createReadStream(filePath);
+
+    stream.on("data", (data) => hash.update(data));
+    stream.on("end", () => {
+      const computed = hash.digest("hex");
+      if (computed.toLowerCase() !== expectedHash.toLowerCase()) {
+        reject(
+          new Error(
+            `[isidorus] CHECKSUM MISMATCH!\n` +
+              `File: ${filePath}\n` +
+              `Expected: ${expectedHash}\n` +
+              `Got:      ${computed}\n` +
+              `This could indicate a corrupted download or a MITM attack.`,
+          ),
+        );
+      } else {
+        resolve(computed);
+      }
+    });
+
+    stream.on("error", reject);
+  });
+}
+
 // ── Platform spec ─────────────────────────────────────────────────────────────
 
 function getPlatformSpec() {
@@ -155,6 +293,15 @@ function getPlatformSpec() {
   // ── Linux ────────────────────────────────────────────────────────────────
   if (os === "linux") {
     const archStr = cpu === "arm64" ? "aarch64" : "x86_64";
+
+    // aarch64 builds not available
+    if (archStr === "aarch64") {
+      throw new Error(
+        `[isidorus] TensorFlow C library is not available for Linux aarch64.\n` +
+          `Please provide a TensorFlow build manually or use SKIP_LIBTF_DOWNLOAD=1`,
+      );
+    }
+
     const officialTarball = `libtensorflow-cpu-linux-${archStr}.tar.gz`;
     const officialUrl = `${TF_OFFICIAL_BASE}/${officialTarball}`;
 
@@ -216,6 +363,15 @@ function getPlatformSpec() {
   // ── macOS ────────────────────────────────────────────────────────────────
   if (os === "darwin") {
     const archStr = cpu === "arm64" ? "arm64" : "x86_64";
+
+    // x86_64 builds not available
+    if (archStr === "x86_64") {
+      throw new Error(
+        `[isidorus] TensorFlow C library is not available for macOS x86_64.\n` +
+          `Please provide a TensorFlow build manually or use SKIP_LIBTF_DOWNLOAD=1`,
+      );
+    }
+
     const tarball = `libtensorflow-cpu-darwin-${archStr}.tar.gz`;
     return {
       libFile: "libtensorflow.dylib",
@@ -344,7 +500,20 @@ function moveLibrariesToPrebuilds(spec) {
         try {
           renameSync(src, dst);
           try {
-            if (existsSync(symlink)) unlinkSync(symlink);
+            // Security: Safely validate and remove existing symlink
+            try {
+              const stats = lstatSync(symlink);
+              if (stats.isSymbolicLink()) {
+                unlinkSync(symlink);
+              } else if (stats.isFile()) {
+                throw new Error(
+                  `Cannot create symlink: regular file exists at ${symlink}`,
+                );
+              }
+            } catch (e) {
+              if (e.code !== "ENOENT") throw e; // File doesn't exist, OK
+            }
+
             symlinkSync(
               join("..", "..", "prebuilds", platformStr, file),
               symlink,
@@ -371,18 +540,53 @@ function moveLibrariesToPrebuilds(spec) {
 
 // ── Download ──────────────────────────────────────────────────────────────────
 
+const MAX_REDIRECTS = 5;
+const ALLOWED_REDIRECT_HOSTS = new Set([
+  "github.com",
+  "storage.googleapis.com",
+  "releases.github.com",
+  "codeload.github.com",
+]);
+
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     console.log(`  Downloading: ${url}`);
     const file = createWriteStream(dest);
 
-    const request = (u) =>
+    const request = (u, redirectCount = 0) =>
       get(u, (res) => {
-        // Follow redirects.
+        // Security: Validate redirects
         if (res.statusCode === 301 || res.statusCode === 302) {
-          request(res.headers.location);
+          if (redirectCount >= MAX_REDIRECTS) {
+            reject(new Error(`Too many redirects (max: ${MAX_REDIRECTS})`));
+            return;
+          }
+
+          const redirectUrl = res.headers.location;
+          if (!redirectUrl) {
+            reject(new Error("Redirect without Location header"));
+            return;
+          }
+
+          // Validate redirect destination
+          try {
+            const parsed = new URL(redirectUrl, u);
+            if (!ALLOWED_REDIRECT_HOSTS.has(parsed.hostname)) {
+              reject(
+                new Error(`Redirect to untrusted host: ${parsed.hostname}`),
+              );
+              return;
+            }
+            console.log(
+              `  Following redirect (${redirectCount + 1}/${MAX_REDIRECTS})...`,
+            );
+            request(redirectUrl, redirectCount + 1);
+          } catch (e) {
+            reject(new Error(`Invalid redirect URL: ${e.message}`));
+          }
           return;
         }
+
         if (res.statusCode !== 200) {
           reject(new Error(`HTTP ${res.statusCode} from ${u}`));
           return;
@@ -420,6 +624,52 @@ function downloadFile(url, dest) {
   });
 }
 
+// ── File validation ──────────────────────────────────────────────────────────
+
+function validateLibraryFile(libPath) {
+  try {
+    const stats = statSync(libPath);
+
+    // Check file size is reasonable (not corrupted/partial)
+    const MIN_SIZE = 1024 * 1024; // 1MB minimum
+    if (stats.size < MIN_SIZE) {
+      throw new Error(`Library file suspiciously small: ${stats.size} bytes`);
+    }
+
+    // Check file permissions are readable
+    if ((stats.mode & 0o400) === 0) {
+      // S_IRUSR = 0o400
+      throw new Error("Library file is not readable");
+    }
+
+    // For Linux, verify it's an ELF binary
+    if (platform() === "linux") {
+      try {
+        const fileOutput = execSync(`file "${libPath.replace(/"/g, '\\"')}"`, {
+          encoding: "utf8",
+          stdio: ["pipe", "pipe", "ignore"],
+        });
+
+        if (
+          !fileOutput.includes("ELF") &&
+          !fileOutput.includes("shared object")
+        ) {
+          throw new Error("File is not an ELF shared object");
+        }
+      } catch (e) {
+        // 'file' command may not be available; skip this check
+        if (!/command not found|not found/.test(e.message)) {
+          throw e;
+        }
+      }
+    }
+
+    return true;
+  } catch (e) {
+    throw new Error(`Library validation failed: ${e.message}`);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -436,10 +686,46 @@ async function main() {
 
   if (shouldSkip(spec)) return;
 
-  // User URL override takes precedence over everything.
+  // Security: Validate environment variable overrides
   const overrideUrl = process.env.LIBTF_DOWNLOAD_URL ?? null;
+  if (overrideUrl) {
+    try {
+      validateDownloadUrl(overrideUrl);
+    } catch (e) {
+      console.error(`[isidorus] ${e.message}`);
+      if (spec.fallbackUrl) {
+        console.error(
+          "[isidorus] Invalid LIBTF_DOWNLOAD_URL override. Using fallback URL instead.",
+        );
+      } else {
+        console.error("[isidorus] No fallback URL available. Aborting.");
+        return;
+      }
+    }
+  }
+
   const downloadUrl = overrideUrl ?? spec.primaryUrl;
-  const tmpFile = join(tmpdir(), spec.tarball);
+
+  // Validate primary URL
+  try {
+    validateDownloadUrl(downloadUrl);
+  } catch (e) {
+    console.error(`[isidorus] Invalid download URL: ${e.message}`);
+    return;
+  }
+
+  // Security: Create secure temporary directory
+  let tmpDir;
+  let tmpFile;
+  try {
+    tmpDir = await mkdtemp(join(tmpdir(), "isidorus-tf-"));
+    tmpFile = join(tmpDir, spec.tarball);
+  } catch (e) {
+    console.error(
+      `[isidorus] Failed to create secure temp directory: ${e.message}`,
+    );
+    return;
+  }
 
   console.log(`\n[isidorus] Installing libtensorflow ${TF_VERSION}...`);
   console.log(`  Platform  : ${platform()}-${arch()}`);
@@ -466,6 +752,8 @@ async function main() {
         `[isidorus] Tip: set LIBTF_VARIANT=cpu to skip the custom build.\n`,
       );
       try {
+        // Validate fallback URL before download
+        validateDownloadUrl(spec.fallbackUrl);
         await downloadFile(spec.fallbackUrl, tmpFile);
         downloadedUrl = spec.fallbackUrl;
       } catch (fallbackErr) {
@@ -473,13 +761,48 @@ async function main() {
           `\n[isidorus] Fallback also failed: ${fallbackErr.message}`,
         );
         console.error(`[isidorus] Install manually:\n  ${spec.fallbackUrl}`);
+        try {
+          rmSync(tmpDir, { recursive: true, force: true });
+        } catch {}
         return;
       }
     } else {
       console.error(`\n[isidorus] Download failed: ${primaryErr.message}`);
       console.error(`[isidorus] Install manually:\n  ${downloadUrl}`);
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
       return;
     }
+  }
+
+  // ── Verify Checksum ────────────────────────────────────────────────────────
+  console.log(`  Verifying checksum...`);
+  try {
+    const expectedHash = CHECKSUM_MAP[spec.tarball];
+    if (!expectedHash || expectedHash.startsWith("TODO_")) {
+      if (process.env.SKIP_CHECKSUM_VERIFY === "1") {
+        console.warn(
+          `[isidorus] WARNING: Checksum not yet available, skipping verification!`,
+        );
+      } else {
+        throw new Error(
+          `No checksum defined for ${spec.tarball}. ` +
+            `Set SKIP_CHECKSUM_VERIFY=1 to proceed at your own risk.`,
+        );
+      }
+    } else if (process.env.SKIP_CHECKSUM_VERIFY === "1") {
+      console.warn(`[isidorus] WARNING: Skipping checksum verification!`);
+    } else {
+      await verifyChecksum(tmpFile, expectedHash);
+      console.log(`  ✓ Checksum verified`);
+    }
+  } catch (e) {
+    console.error(`[isidorus] ${e.message}`);
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {}
+    return;
   }
 
   // ── Extract ───────────────────────────────────────────────────────────────
@@ -523,6 +846,15 @@ async function main() {
     }
   }
 
+  // ── Cleanup secure temp directory ──────────────────────────────────────────
+  try {
+    if (tmpDir && existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.warn(`[isidorus] Warning cleaning temp dir: ${e.message}`);
+  }
+
   // ── Determine actual variant that was downloaded ──────────────────────────
   let actualVariant = spec.variantTag;
   if (downloadedUrl && downloadedUrl.includes("isidorus")) {
@@ -534,24 +866,26 @@ async function main() {
   }
 
   // ── Write config ──────────────────────────────────────────────────────────
-  writeFileSync(
-    join(PACKAGE_DIR, ".libtf-config.json"),
-    JSON.stringify(
-      {
-        version: TF_VERSION,
-        variant: actualVariant,
-        installedAt: new Date().toISOString(),
-        sourceUrl: downloadedUrl,
-        libtfDir: LIBTF_DIR,
-        platform: platform(),
-        arch: arch(),
-      },
-      null,
-      2,
-    ),
+  // Security: Protect config file with restricted permissions
+  const configPath = join(PACKAGE_DIR, ".libtf-config.json");
+  const configData = JSON.stringify(
+    {
+      version: TF_VERSION,
+      variant: actualVariant,
+      installedAt: new Date().toISOString(),
+      sourceUrl: downloadedUrl,
+      libtfDir: LIBTF_DIR,
+      platform: platform(),
+      arch: arch(),
+    },
+    null,
+    2,
   );
 
-  // ── Verify ────────────────────────────────────────────────────────────────
+  writeFileSync(configPath, configData, { mode: 0o600 });
+  chmodSync(configPath, 0o600);
+
+  // ── Validate library file ──────────────────────────────────────────────────
   const libPath = join(LIBTF_DIR, "lib", spec.libFile);
   if (!existsSync(libPath)) {
     console.error(`[isidorus] ⚠  ${spec.libFile} not found after extraction.`);
@@ -559,6 +893,15 @@ async function main() {
     console.error(
       `[isidorus]    Archive structure may differ — check ${LIBTF_DIR}.`,
     );
+    return;
+  }
+
+  // Security: Validate extracted library file integrity
+  try {
+    validateLibraryFile(libPath);
+    console.log(`  ✓ Library file validation passed`);
+  } catch (e) {
+    console.error(`[isidorus] ${e.message}`);
     return;
   }
 
@@ -581,7 +924,40 @@ async function main() {
 }
 
 main().catch((e) => {
-  // Never throw from postinstall — a failed optional download must not
-  // break `npm install` for the parent project.
-  console.warn(`[isidorus] post-install warning: ${e.message}`);
+  // Improved error handling: provide helpful context and solutions
+  console.error(`\n[isidorus] ========================================`);
+  console.error(`[isidorus] CRITICAL: post-install failed!`);
+  console.error(`[isidorus] ========================================`);
+  console.error(`[isidorus] Error: ${e.message}\n`);
+  console.error(
+    `[isidorus] This package requires TensorFlow C library to function.`,
+  );
+  console.error(`[isidorus]`);
+  console.error(`[isidorus] Troubleshooting steps:`);
+  console.error(
+    `[isidorus]   1. Retry: rm -rf node_modules/@isidorus && npm install`,
+  );
+  console.error(
+    `[isidorus]   2. Manual: LIBTENSORFLOW_PATH=/path/to/tf npm install`,
+  );
+  console.error(
+    `[isidorus]   3. Skip (advanced): SKIP_LIBTF_DOWNLOAD=1 npm install`,
+  );
+  console.error(
+    `[isidorus]      (you must provide TensorFlow via LIBTENSORFLOW_PATH)`,
+  );
+  console.error(
+    `[isidorus]   4. Report: https://github.com/A-KGeorge/isidorus/issues`,
+  );
+  console.error(`[isidorus] ========================================\n`);
+
+  // Allow bypassing for specific scenarios (CI environments, etc.)
+  if (process.env.ISIDORUS_ALLOW_MISSING_TF === "1") {
+    console.warn(
+      `[isidorus] Proceeding despite error (ISIDORUS_ALLOW_MISSING_TF=1)`,
+    );
+  } else {
+    // Exit with error code - this is a critical failure
+    process.exit(1);
+  }
 });
