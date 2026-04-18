@@ -484,6 +484,7 @@ const ALLOWED_REDIRECT_HOSTS = new Set([
   "storage.googleapis.com",
   "releases.github.com",
   "codeload.github.com",
+  "release-assets.githubusercontent.com",
 ]);
 
 function downloadFile(url, dest) {
