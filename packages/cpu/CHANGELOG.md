@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.22
+
+### Patch Changes
+
+- bc5eeaf: Fix postinstall to fetch correct libtensorflow binary for linux
+
 ## 0.0.0-alpha.21
 
 ### Patch Changes
