@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.25
+
+### Patch Changes
+
+- 3e06123: Enhanced security
+
 ## 0.0.0-alpha.24
 
 ### Patch Changes
