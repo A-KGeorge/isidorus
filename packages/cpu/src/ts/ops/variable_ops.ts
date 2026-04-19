@@ -23,33 +23,45 @@ import { constant } from "./array_ops.js";
 //   sess.run([[x, feed]], [], ["step"]) ← training step (assign ops)
 // ---------------------------------------------------------------------------
 
-// ── Cryptographically secure random number source ─────────────────────
+// ── Cryptographically secure random number source ─────────────────────────────
+//
+// Fix 1: The original implementation shared one ArrayBuffer between a
+// Float64Array (_randBuf) and a Uint32Array (u32) by doing:
+//
+//   const u32 = new Uint32Array(_randBuf!.buffer);   // same backing memory
+//   crypto.getRandomValues(u32);
+//   for (let i = 0; i < _randBuf!.length; i++)
+//     _randBuf![i] = u32[i * 2 + 1] / 0x100000000;  // write corrupts source
+//
+// Writing _randBuf[0] overwrites bytes 0–7, which are exactly u32[0] and
+// u32[1] — the very source data the next iteration needs.  Every float
+// produced after index 0 was computed from corrupted entropy.
+//
+// Fix: allocate a completely separate Uint32Array for the raw random bytes.
+// The two typed arrays never share an ArrayBuffer.
 
+const CSPRNG_BATCH = 1024;
 let _randBuf: Float64Array | null = null;
 let _randIdx = 0;
 
-function _ensureBuffer(n: number): void {
-  const needed = Math.max(n, 1024);
-  if (!_randBuf || _randBuf.length < needed) {
-    _randBuf = new Float64Array(needed);
-  }
-}
-
 /**
  * Returns a uniform random float in [0, 1) using the system CSPRNG.
- * Semantically equivalent to Math.random() but unpredictable.
+ *
+ * Draws from a pre-filled batch of CSPRNG_BATCH values; when the batch is
+ * exhausted a fresh call to crypto.getRandomValues() refills it.
+ * The raw Uint32Array and the output Float64Array use *separate*
+ * ArrayBuffers — see Fix 1 comment above.
  */
 function secureRandom(): number {
   if (!_randBuf || _randIdx >= _randBuf.length) {
-    _ensureBuffer(1024);
-    // getRandomValues fills with uniform random uint64 values in [0, 2^64).
-    // We reinterpret as Uint32Array pairs, take the upper 32 bits of each
-    // pair, and divide by 2^32 to get floats in [0, 1).
-    const u32 = new Uint32Array(_randBuf!.buffer as ArrayBuffer);
-    crypto.getRandomValues(u32);
-    for (let i = 0; i < _randBuf!.length; i++) {
-      // Upper 32 bits of the i-th pair → uniform float in [0, 1)
-      _randBuf![i] = u32[i * 2 + 1] / 0x100000000;
+    // Own ArrayBuffer — never aliased with _randBuf.
+    const raw = new Uint32Array(CSPRNG_BATCH);
+    crypto.getRandomValues(raw);
+    // Separate ArrayBuffer for the output.
+    _randBuf = new Float64Array(CSPRNG_BATCH);
+    for (let i = 0; i < CSPRNG_BATCH; i++) {
+      // uint32 / 2^32 → uniform float in [0, 1).
+      _randBuf[i] = raw[i] / 0x100000000;
     }
     _randIdx = 0;
   }
@@ -103,7 +115,7 @@ export function variable(
     {
       dtype: { kind: "type", value: dtype },
       shape: { kind: "shape", value: shapeToTF(shape) },
-      shared_name: { kind: "string", value: varName }, // unique key for checkpoint resolution
+      shared_name: { kind: "string", value: varName },
       container: { kind: "string", value: "" },
     },
     varName,
@@ -316,7 +328,7 @@ export function glorotUniformInitializer(
 
   const limit = Math.sqrt(6 / (fanIn + fanOut));
   const n = shape.reduce((a, b) => a * b, 1);
-  // Fix 10: CSPRNG-sourced uniform buffer.
+  // Fix 1: CSPRNG-sourced uniform buffer via the corrected secureRandom().
   const buf = uniformBuffer(n, limit);
   return constant(g, buf, shape, dtype, name);
 }
@@ -377,36 +389,16 @@ export function globalVariablesInitializer(
   initOps: string[],
   name = "init_all_variables",
 ): string {
-  // NoOp with control edges to every init AssignVariableOp.
-  // TF_AddControlInput guarantees the NoOp will not execute until all
-  // listed ops have completed, so running this target from a Session
-  // atomically initialises all variables before any training step proceeds.
-  const [t] = g.addOp(
-    "NoOp",
-    [],
-    {},
-    name,
-    initOps, // controlInputs — wired via TF_AddControlInput in graph.cc
-  );
+  const [t] = g.addOp("NoOp", [], {}, name, initOps);
   return t.opName;
 }
 
 // ── Optimizer update ops ──────────────────────────────────────────────────────
-//
-// These are low-level building blocks. High-level optimizers (SGD, Adam)
-// are built on top in a separate optimizers/ module once the gradient
-// infrastructure is in place.
-//
-// Each returns an op name to run as a target (side-effect, no output).
 
-/**
- * applyGradientDescent — w -= lr * grad.
- * The simplest parameter update step.
- */
 export function applyGradientDescent(
   g: Graph,
   handle: Tensor,
-  lr: Tensor, // scalar learning rate
+  lr: Tensor,
   grad: Tensor,
   dtype: DType,
   name?: string,

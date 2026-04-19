@@ -9,10 +9,6 @@
 
 // ----------------------------------------------------------------------------
 // Platform CPU affinity abstractions
-//
-// AffinityMask: bitmask where bit N = 1 means "this thread may run on core N"
-// Supports up to 64 cores. Sytems with > 64 cores need processor groups
-// (Windows) or cpu_set_t extension (Linux) - not handled here
 // ----------------------------------------------------------------------------
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -24,7 +20,7 @@ using AffinityMask = DWORD_PTR;
 #include <sched.h>
 #include <pthread.h>
 using AffinityMask = uint64_t;
-#endif // _WIN32
+#endif
 
 #ifndef ISIDORUS_STATUS_GUARD_DEFINED
 #define ISIDORUS_STATUS_GUARD_DEFINED
@@ -42,30 +38,19 @@ struct StatusGuard
 };
 #endif
 
-// ----------------------------------------------------------------------------
-// Affinity helpers - declared here, defined in session.cc
-// ----------------------------------------------------------------------------
-
-// Get the affinity mask of the calling thread.
+// Affinity helpers — declared here, defined in session.cc
 AffinityMask affinity_get();
-
-// Set the affinity mask of the calling thread.
-// Returns true on success.
 bool affinity_set(AffinityMask mask);
-
-// Build a mask covering cores [first_core, num_cores).
-// e.g. affinity_mask_range(2, 6) = cores 2,3,4,5 (bits 2..5 set)
 AffinityMask affinity_mask_range(int first_core, int num_cores);
-
-// Build a mask covering all cores on a given NUMA node.
 AffinityMask affinity_mask_numa_node(int numa_node);
-
-// Build  a mask covering all online cores.
 AffinityMask affinity_mask_all();
 
-// Maximum number of completion items allowed in the native queue before
-// rejecting new runAsync requests to prevent unbounded memory growth.
+// Maximum items in the native completion queue before rejecting new requests.
 static constexpr size_t MAX_NATIVE_COMPLETION_QUEUE = 512;
+
+// Timeout (seconds) for the cleanup() spin-wait.  If in-flight workers have
+// not drained within this window a warning is printed and cleanup proceeds.
+static constexpr int CLEANUP_SPIN_TIMEOUT_SEC = 30;
 
 // ----------------------------------------------------------------------------
 // SessionWrap
@@ -78,14 +63,11 @@ public:
     explicit SessionWrap(const Napi::CallbackInfo &info);
     ~SessionWrap() override;
 
-    // Affinity masks used by RunCtx - set in constructor, read in OnRunWork.
-    AffinityMask tf_affinity_mask_ = 0; // 0 = no restriction
+    AffinityMask tf_affinity_mask_ = 0;
     AffinityMask full_affinity_mask_ = 0;
 
 public:
     // Public for SessionCompletionCallJs (static fn, no friend access).
-    // Not part of the JS-visible API.
-
     std::atomic<bool> destroyed_{false};
     std::atomic<int> in_flight_count_{0};
     napi_threadsafe_function completion_tsfn_ = nullptr;
@@ -98,6 +80,8 @@ private:
     Napi::ObjectReference graph_ref_;
     int intra_op_threads_ = 1;
     int inter_op_threads_ = 1;
+
+    napi_env env_ = nullptr;
 
     void cleanup();
 

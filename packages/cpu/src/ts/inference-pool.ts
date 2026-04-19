@@ -1,20 +1,5 @@
 /**
  * InferencePool — concurrent TF inference via a single session and async queue.
- *
- * Architecture:
- *   A single TF session handles all concurrent requests. TF's internal thread
- *   scheduler (intra/interOpThreads) handles CPU parallelism — it knows which
- *   ops can run in parallel and avoids false sharing across cores. An async JS
- *   queue manages concurrent callers; maxQueueDepth provides backpressure.
- *
- *   The autotuner benchmarks candidate intra/inter/concurrency configs during
- *   create() and selects the best for this model on this machine (~300ms cold
- *   start). Override with explicit intraOpThreads/maxConcurrent to skip it.
- *
- * Benchmark results (AMD Ryzen 9 5900X, 24 threads):
- *   bench_small (MobileNetV2, 224x224x3):  1.36-3.5x faster than tfjs-node
- *   bench_medium (ResNet50, 224x224x3):    1.30-2.35x faster than tfjs-node
- *   bench_large (Dense ~44M params):       tfjs-node wins on memory-bw workloads
  */
 
 import { readFileSync, statSync } from "fs";
@@ -121,24 +106,16 @@ const AUTOTUNE_INTRA_CANDIDATES = [1, 2, 4, 8, 16, 32];
 const AUTOTUNE_WARMUP = 3;
 const AUTOTUNE_ITERS = 10;
 const AUTOTUNE_ITERS_LARGE = 5;
-const AUTOTUNE_LARGE_MODEL_BYTES = 50 * 1024 * 1024; // 50 MB
-
-// When two configs are within this fraction of each other in throughput score,
-// prefer the one with higher intraOpThreads (= lower per-request latency).
-// Without this tiebreaker, noise in 10-iter timing can cause the autotuner to
-// pick a high-concurrency/low-intra config that has similar throughput but
-// much worse latency (e.g. 57ms vs 18ms for ResNet50 on a 24-core machine).
-const AUTOTUNE_LATENCY_PREFERENCE_MARGIN = 0.08; // 8%
-
-/**
- *
- * @returns The size of the libuv thread pool, which is the effective concurrency ceiling for TF sessions. Defaults to 4 if UV_THREADPOOL_SIZE is not set or invalid.
- */
+const AUTOTUNE_LARGE_MODEL_BYTES = 50 * 1024 * 1024;
+const AUTOTUNE_LATENCY_PREFERENCE_MARGIN = 0.08;
 
 function getUvPoolSize(): number {
   const raw = parseInt(process.env["UV_THREADPOOL_SIZE"] ?? "", 10);
-  // Fix 14: NaN, negative, or astronomically large values all fall back to 4.
-  if (!Number.isFinite(raw) || raw < 1 || raw > 4096) return 4;
+  // Fix 11: Node hard-caps UV_THREADPOOL_SIZE at 1024 (128 before Node 22).
+  // Accepting values above 1024 would cause the autotuner to select
+  // maxConcurrent values that Node silently reduces, producing a pool that
+  // appears correctly configured while actually being over-subscribed.
+  if (!Number.isFinite(raw) || raw < 1 || raw > 1024) return 4;
   return raw;
 }
 
@@ -480,7 +457,7 @@ export class InferencePool {
           try {
             s.destroy();
           } catch {
-            /* ignore cleanup errors */
+            /* ignore */
           }
         }
         throw error;
@@ -562,7 +539,7 @@ export class InferencePool {
   infer(
     inputData: DataLike,
     inputShape: number[],
-    inputDtype: number = 1, // TF_FLOAT
+    inputDtype: number = 1,
   ): Promise<PoolResult> {
     if (this.destroyed)
       return Promise.reject(new Error("InferencePool has been destroyed"));
@@ -684,11 +661,13 @@ export class InferencePool {
     if (this.destroyed) throw new Error("InferencePool has been destroyed");
     if (inputs.length === 0) return [];
 
-    // Submit all items concurrently (pool enforces maxConcurrent internally).
-    // We track promises in submission order to return results sorted correctly.
-    const promises = inputs.map((buf) =>
-      this.infer(buf, inputShape, inputDtype),
-    );
+    const promises = inputs.map((buf) => {
+      try {
+        return this.infer(buf, inputShape, inputDtype);
+      } catch (e) {
+        return Promise.reject(e as Error);
+      }
+    });
     return Promise.all(promises);
   }
 

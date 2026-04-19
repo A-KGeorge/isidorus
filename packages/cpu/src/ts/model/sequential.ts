@@ -103,6 +103,10 @@ export class Sequential {
   private _nonTrainable!: LayerParam[]; // moving_mean/var — saved but not trained
   private _hasBatchNorm!: boolean; // true if any layer is BatchNormalization
   private _outputShape!: (number | null)[]; // shape after last layer
+  // Fix 13: two-phase guard — compiling is set immediately on entry so a
+  // concurrent call cannot also pass the compiled check while we're building.
+  // If compile() throws, compiling stays true (intentional: discard the model).
+  private compiling = false;
   private compiled = false;
 
   constructor(g: Graph, layers: Layer[]) {
@@ -122,7 +126,9 @@ export class Sequential {
     inputShape: number[];
     labelDtype?: DType;
   }): void {
-    if (this.compiled) throw new Error("Sequential.compile() called twice");
+    if (this.compiled || this.compiling)
+      throw new Error("Sequential.compile() called twice");
+    this.compiling = true; // Fix 13: block concurrent calls immediately
 
     const { loss, inputShape } = opts;
     this._compiledInputShape = inputShape;

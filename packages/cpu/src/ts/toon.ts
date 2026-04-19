@@ -1,44 +1,15 @@
 /**
  * toon.ts — Token Oriented Object Notation
  *
- * A compact binary serialization format for isidorus model manifests.
- * Designed for two properties JSON lacks:
- *   1. Compact — no repeated key strings, integers in varint encoding
- *   2. Fast to parse — single forward scan, no backtracking, no regex
- *
- * Format overview
- * ───────────────
- * All multi-byte integers are little-endian.
- * Strings are length-prefixed: [varint byte_length][utf8 bytes].
- * The file begins with a 4-byte magic header: 0x544F4F4E ("TOON").
- *
- * Token types (1 byte tag):
- *   0x01  NULL
- *   0x02  TRUE
- *   0x03  FALSE
- *   0x04  INT      [int32 LE]            4 bytes
- *   0x05  FLOAT    [float64 LE]          8 bytes
- *   0x06  STRING   [varint len][utf8]
- *   0x07  BYTES    [varint len][bytes]   raw binary blob
- *   0x08  ARRAY    [varint count] items
- *   0x09  OBJECT   [varint count] key-value pairs: STRING value STRING value...
- *                  (keys are bare string bodies — no tag byte, length-prefixed)
- *   0x0A  BIGINT   [varint len][LE bytes] arbitrary precision, unsigned
- *
- * Varints: unsigned LEB128 encoding (same as protobuf).
- *
- * Usage
- * ─────
- *   import { toonEncode, toonDecode } from "./toon.js";
- *   const bytes = toonEncode(manifest);
- *   const back  = toonDecode(bytes);
+ * Fix 9: toonDecode now verifies that all bytes in the buffer were consumed.
+ * Previously, a truncated or partially-written TOON buffer that decoded a
+ * valid prefix would return silently, hiding corruption.  The new check
+ * throws RangeError if any trailing bytes remain after the root value.
  */
 
-// ── Magic ─────────────────────────────────────────────────────────────────────
+import type {} from "./toon.js"; // keep the Buffer prototype extension side-effect
 
-const MAGIC = 0x4e4f4f54; // "TOON" in little-endian uint32
-
-// ── Tags ──────────────────────────────────────────────────────────────────────
+const MAGIC = 0x4e4f4f54; // "TOON" LE
 
 const T_NULL = 0x01;
 const T_TRUE = 0x02;
@@ -88,11 +59,9 @@ function readVarint(
     shift += 7;
     if (shift > 28) throw new RangeError("TOON: varint overflow (> 28 bits)");
   }
-  // Fix 8: coerce to unsigned 32-bit and verify it is a safe non-negative int.
   const value = result >>> 0;
   if (!Number.isSafeInteger(value) || value < 0)
     throw new RangeError(`TOON: varint decoded to invalid value ${value}`);
-  // Fix 8: reject implausible lengths before any Buffer allocation.
   if (checkLength && value > MAX_VALUE_BYTE_LENGTH)
     throw new RangeError(
       `TOON: value byte-length ${value} exceeds maximum ${MAX_VALUE_BYTE_LENGTH}`,
@@ -104,19 +73,19 @@ function readVarint(
 
 /** Compute the encoded byte size of a value without allocating. */
 function sizeOf(value: unknown): number {
-  if (value === null || value === undefined) return 1; // tag only
-  if (value === true || value === false) return 1; // tag only
+  if (value === null || value === undefined) return 1;
+  if (value === true || value === false) return 1;
   if (typeof value === "number") {
     if (Number.isInteger(value) && value >= -2147483648 && value <= 2147483647)
-      return 1 + 4; // tag + int32
-    return 1 + 8; // tag + float64
+      return 1 + 4;
+    return 1 + 8;
   }
   if (typeof value === "string") {
     const len = Buffer.byteLength(value, "utf8");
-    return 1 + varintSize(len) + len; // tag + vlen + body
+    return 1 + varintSize(len) + len;
   }
   if (Buffer.isBuffer(value)) {
-    return 1 + varintSize(value.byteLength) + value.byteLength; // tag + vlen + body
+    return 1 + varintSize(value.byteLength) + value.byteLength;
   }
   if (Array.isArray(value)) {
     return (
@@ -216,7 +185,7 @@ function encodeInto(buf: Buffer, offset: number, value: unknown): number {
  */
 export function toonEncode(value: unknown): Buffer {
   const bodySize = sizeOf(value);
-  const buf = Buffer.allocUnsafe(4 + bodySize); // 4-byte magic
+  const buf = Buffer.allocUnsafe(4 + bodySize);
   buf.writeUInt32LE(MAGIC, 0);
   encodeInto(buf, 4, value);
   return buf;
@@ -228,7 +197,6 @@ export function toonEncode(value: unknown): Buffer {
 const BLOCKED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 function readKey(buf: Buffer, offset: number): { key: string; offset: number } {
-  // Fix 8: pass checkLength=true so oversized key lengths are rejected.
   const { value: len, offset: o1 } = readVarint(buf, offset, true);
   if (o1 + len > buf.length)
     throw new RangeError("TOON: key string extends past end of buffer");
@@ -296,10 +264,7 @@ function decodeValue(
       for (let i = 0; i < count; i++) {
         const kr = readKey(buf, o);
         const vr = decodeValue(buf, kr.offset);
-
-        if (!BLOCKED_KEYS.has(kr.key)) {
-          obj[kr.key] = vr.value;
-        }
+        if (!BLOCKED_KEYS.has(kr.key)) obj[kr.key] = vr.value;
         o = vr.offset;
       }
 
@@ -314,15 +279,28 @@ function decodeValue(
 
 /**
  * toonDecode — deserialise a TOON Buffer back to a value.
- * Buffer (T_BYTES) values are returned as Node.js Buffer instances.
- * @throws RangeError on malformed input.
+ *
+ * Fix 9: throws RangeError if any bytes remain after the decoded root value.
+ * This catches truncated writes and appended garbage that previously decoded
+ * silently to stale data.
  */
 export function toonDecode(buf: Buffer): unknown {
   if (buf.byteLength < 4) throw new RangeError("TOON: buffer too short");
   const magic = buf.readUInt32LE(0);
   if (magic !== MAGIC)
     throw new RangeError(`TOON: bad magic 0x${magic.toString(16)}`);
-  const { value } = decodeValue(buf, 4);
+
+  const { value, offset } = decodeValue(buf, 4);
+
+  // Fix 9: reject trailing bytes — they indicate corruption or a partial write.
+  if (offset !== buf.byteLength)
+    throw new RangeError(
+      `TOON: ${
+        buf.byteLength - offset
+      } trailing byte(s) after decoded value — ` +
+        `buffer may be corrupted or partially written`,
+    );
+
   return value;
 }
 

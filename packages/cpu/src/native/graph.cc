@@ -42,16 +42,6 @@ GraphWrap::~GraphWrap()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fix 15: op_counter_ is now std::atomic<int> (see graph.h).
-// fetch_add(1, relaxed) is sufficient — we only need uniqueness, not ordering.
-//
-// Op-name sanitisation (defence-in-depth):
-//   TF op names must match [A-Za-z0-9_./:-]+.
-//   We strip any character outside that set before passing to TF_NewOperation.
-//   This prevents checkpoint-supplied names from injecting shell metacharacters
-//   that could reach extractCmd or other shell-interpolated strings.
-// ---------------------------------------------------------------------------
 static std::string sanitize_op_name(const std::string &name)
 {
     static const std::regex valid_chars("[^A-Za-z0-9_./:_\\-]");
@@ -60,19 +50,7 @@ static std::string sanitize_op_name(const std::string &name)
 
 // ---------------------------------------------------------------------------
 // addOp — JS signature:
-//   addOp(
-//     type:          string,
-//     inputs:        { opName: string; index: number }[],
-//     attrs?:        Record<string, AttrValue>,
-//     name?:         string,
-//     controlInputs?: string[],
-//   ) -> { opName: string; numOutputs: number }
-//
-// Control inputs are wired via TF_AddControlInput.  TF guarantees the
-// described op will not execute until every control-input op has completed.
-// This is the mechanism behind globalVariablesInitializer: a NoOp with
-// control edges to all init AssignVariableOps — running the NoOp forces all
-// assignments to execute first.
+//   addOp(type, inputs, attrs?, name?, controlInputs?) -> { opName, numOutputs }
 // ---------------------------------------------------------------------------
 Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
 {
@@ -94,15 +72,25 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
     }
 
     std::string op_type = info[0].As<Napi::String>().Utf8Value();
-    // Fix 15: atomic fetch_add instead of plain op_counter_++
     int counter_val = op_counter_.fetch_add(1, std::memory_order_relaxed);
     std::string op_name = op_type + "_" + std::to_string(counter_val);
     if (info.Length() >= 4 && info[3].IsString())
         op_name = info[3].As<Napi::String>().Utf8Value();
 
-    // Defence-in-depth: sanitise the op name so checkpoint-supplied strings
-    // cannot inject metacharacters into any downstream shell interpolation.
     op_name = sanitize_op_name(op_name);
+
+    // Fix 12: Check for duplicate op names upfront and emit a clear,
+    // actionable error rather than a cryptic TF internal message.
+    // TF_GraphOperationByName is O(1) (hash map lookup) so this is cheap.
+    if (TF_GraphOperationByName(graph_, op_name.c_str()) != nullptr)
+    {
+        Napi::Error::New(env,
+                         "Duplicate op name: \"" + op_name + "\" already exists "
+                                                             "in this graph — use a unique `name` argument or omit it "
+                                                             "to get an auto-generated name")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
 
     // ── Resolve data inputs ─────────────────────────────────────────────────
     std::vector<TF_Output> resolved_inputs;
@@ -117,8 +105,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
         if (!op_name_val.IsString())
         {
             Napi::TypeError::New(
-                env,
-                "inputs[" + std::to_string(i) + "].opName must be a string")
+                env, "inputs[" + std::to_string(i) + "].opName must be a string")
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }
@@ -129,8 +116,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
         if (!index_val.IsNumber())
         {
             Napi::TypeError::New(
-                env,
-                "inputs[" + std::to_string(i) + "].index must be a number")
+                env, "inputs[" + std::to_string(i) + "].index must be a number")
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }
@@ -160,8 +146,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 TF_GraphOperationByName(graph_, ctrl_name.c_str());
             if (!ctrl_op)
             {
-                Napi::Error::New(env,
-                                 "Control input op not found: " + ctrl_name)
+                Napi::Error::New(env, "Control input op not found: " + ctrl_name)
                     .ThrowAsJavaScriptException();
                 return env.Undefined();
             }
@@ -209,23 +194,17 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
 
             auto attr_val_raw = attrs.Get(attr_name);
             if (!attr_val_raw.IsObject())
-            {
-                // Silently skip non-object attributes
                 continue;
-            }
             auto attr_val = attr_val_raw.As<Napi::Object>();
 
             auto kind_val = attr_val.Get("kind");
             if (!kind_val.IsString())
-            {
-                // Silently skip attributes without a string 'kind'
                 continue;
-            }
             std::string kind_str = kind_val.As<Napi::String>().Utf8Value();
 
             auto it = kind_map.find(kind_str);
-            AttrKind kind = (it != kind_map.end()) ? it->second
-                                                   : AttrKind::Unknown;
+            AttrKind kind = (it != kind_map.end()) ? it->second : AttrKind::Unknown;
+
             switch (kind)
             {
             case AttrKind::Int:
@@ -233,8 +212,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 auto val = attr_val.Get("value");
                 if (!val.IsNumber())
                     break;
-                int64_t v = static_cast<int64_t>(
-                    val.As<Napi::Number>().Int64Value());
+                int64_t v = static_cast<int64_t>(val.As<Napi::Number>().Int64Value());
                 TF_SetAttrInt(desc, attr_name.c_str(), v);
                 break;
             }
@@ -243,8 +221,8 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 auto val = attr_val.Get("value");
                 if (!val.IsNumber())
                     break;
-                float f = val.As<Napi::Number>().FloatValue();
-                TF_SetAttrFloat(desc, attr_name.c_str(), f);
+                TF_SetAttrFloat(desc, attr_name.c_str(),
+                                val.As<Napi::Number>().FloatValue());
                 break;
             }
             case AttrKind::Bool:
@@ -252,9 +230,8 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 auto val = attr_val.Get("value");
                 if (!val.IsBoolean())
                     break;
-                unsigned char b =
-                    val.As<Napi::Boolean>().Value() ? 1 : 0;
-                TF_SetAttrBool(desc, attr_name.c_str(), b);
+                TF_SetAttrBool(desc, attr_name.c_str(),
+                               val.As<Napi::Boolean>().Value() ? 1 : 0);
                 break;
             }
             case AttrKind::Type:
@@ -262,9 +239,9 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 auto val = attr_val.Get("value");
                 if (!val.IsNumber())
                     break;
-                TF_DataType v = static_cast<TF_DataType>(
-                    val.As<Napi::Number>().Int32Value());
-                TF_SetAttrType(desc, attr_name.c_str(), v);
+                TF_SetAttrType(desc, attr_name.c_str(),
+                               static_cast<TF_DataType>(
+                                   val.As<Napi::Number>().Int32Value()));
                 break;
             }
             case AttrKind::Shape:
@@ -302,8 +279,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                         v.As<Napi::Number>().Int32Value());
                 }
                 TF_SetAttrTypeList(desc, attr_name.c_str(),
-                                   types.data(),
-                                   static_cast<int>(types.size()));
+                                   types.data(), static_cast<int>(types.size()));
                 break;
             }
             case AttrKind::ListInt:
@@ -322,8 +298,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                         v.As<Napi::Number>().Int64Value());
                 }
                 TF_SetAttrIntList(desc, attr_name.c_str(),
-                                  ints.data(),
-                                  static_cast<int>(ints.size()));
+                                  ints.data(), static_cast<int>(ints.size()));
                 break;
             }
             case AttrKind::Tensor:
@@ -379,8 +354,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
                 auto vnode = attr_val.Get("value");
                 if (vnode.IsString())
                     sv = vnode.As<Napi::String>().Utf8Value();
-                TF_SetAttrString(desc, attr_name.c_str(),
-                                 sv.data(), sv.size());
+                TF_SetAttrString(desc, attr_name.c_str(), sv.data(), sv.size());
                 break;
             }
             default:
@@ -393,8 +367,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
     };
 
     // ── Build the op description ────────────────────────────────────────────
-    auto finish_op = [&](bool list_input,
-                         std::string &err) -> TF_Operation *
+    auto finish_op = [&](bool list_input, std::string &err) -> TF_Operation *
     {
         StatusGuard status;
         TF_OperationDescription *desc =
@@ -438,15 +411,33 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
     std::string first_error;
     TF_Operation *op = finish_op(false, first_error);
 
-    // Some ops have a single list-valued input arg — retry with AddInputList.
-    if (!op &&
-        first_error.find("expected list") != std::string::npos &&
-        !resolved_inputs.empty())
+    // Fix 10: use a table of known TF error phrases instead of a single
+    // English substring match.  This survives TF version bumps that rephrase
+    // the internal error message.  Extend the table if future TF versions
+    // introduce new phrasings for the same "list input expected" condition.
+    if (!op && !resolved_inputs.empty())
     {
-        std::string retry_error;
-        op = finish_op(true, retry_error);
-        if (!op)
-            first_error = retry_error;
+        static const char *const LIST_INDICATORS[] = {
+            "expected list",       // TF <= 2.x common phrasing
+            "Single tensor input", // alternative phrasing in some builds
+            nullptr,
+        };
+        bool needs_list = false;
+        for (const char *const *p = LIST_INDICATORS; *p; ++p)
+        {
+            if (first_error.find(*p) != std::string::npos)
+            {
+                needs_list = true;
+                break;
+            }
+        }
+        if (needs_list)
+        {
+            std::string retry_error;
+            op = finish_op(true, retry_error);
+            if (!op)
+                first_error = retry_error;
+        }
     }
 
     if (!op)
@@ -467,7 +458,7 @@ Napi::Value GraphWrap::AddOp(const Napi::CallbackInfo &info)
 }
 
 // ---------------------------------------------------------------------------
-// addGradients — unchanged from original
+// addGradients
 // ---------------------------------------------------------------------------
 Napi::Value GraphWrap::AddGradients(const Napi::CallbackInfo &info)
 {
@@ -522,8 +513,7 @@ Napi::Value GraphWrap::AddGradients(const Napi::CallbackInfo &info)
             return env.Undefined();
         if (dx_vec.size() != y_vec.size())
         {
-            Napi::Error::New(env,
-                             "addGradients: dx length must equal y length")
+            Napi::Error::New(env, "addGradients: dx length must equal y length")
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }
@@ -544,8 +534,7 @@ Napi::Value GraphWrap::AddGradients(const Napi::CallbackInfo &info)
 
     if (!status.ok())
     {
-        Napi::Error::New(env,
-                         "TF_AddGradients failed: " + status.message())
+        Napi::Error::New(env, "TF_AddGradients failed: " + status.message())
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -564,7 +553,7 @@ Napi::Value GraphWrap::AddGradients(const Napi::CallbackInfo &info)
 }
 
 // ---------------------------------------------------------------------------
-// Remaining methods — unchanged from previous iteration
+// Remaining methods
 // ---------------------------------------------------------------------------
 
 Napi::Value GraphWrap::HasOp(const Napi::CallbackInfo &info)
@@ -629,14 +618,12 @@ Napi::Value GraphWrap::ToGraphDef(const Napi::CallbackInfo &info)
     if (!status.ok())
     {
         TF_DeleteBuffer(buf);
-        Napi::Error::New(env,
-                         "TF_GraphToGraphDef failed: " + status.message())
+        Napi::Error::New(env, "TF_GraphToGraphDef failed: " + status.message())
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
     auto node_buf = Napi::Buffer<uint8_t>::Copy(
-        env,
-        reinterpret_cast<const uint8_t *>(buf->data), buf->length);
+        env, reinterpret_cast<const uint8_t *>(buf->data), buf->length);
     TF_DeleteBuffer(buf);
     return node_buf;
 }

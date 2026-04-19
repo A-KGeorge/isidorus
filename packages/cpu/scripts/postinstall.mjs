@@ -58,7 +58,7 @@ import { platform, arch, tmpdir } from "node:os";
 import { get } from "node:https";
 import crypto from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
-import { execFile as _execFile, execSync } from "node:child_process";
+import { execFile as _execFile, execSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(_execFile);

@@ -3,6 +3,7 @@
 #include <uv.h>
 #include <cstring>
 #include <thread>
+#include <chrono> // Fix 6: for steady_clock timeout in cleanup()
 #include <cstdio>
 
 // ── ConfigProto minimal binary encoding ──────────────────────────────────────
@@ -267,6 +268,10 @@ SessionWrap::SessionWrap(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
+    // Fix 4: store env_ so cleanup() can reject deferreds without passing
+    // nullptr (which is UB in napi_delete_reference / napi_reject_deferred).
+    env_ = static_cast<napi_env>(env);
+
     if (info.Length() < 1 || !info[0].IsObject())
     {
         Napi::TypeError::New(env, "Session(graph: Graph, options?)")
@@ -387,19 +392,15 @@ SessionWrap::~SessionWrap() { cleanup(); }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────
 //
-// Fix 3 + Fix 6:
-//   1. Set destroyed_ = true atomically so OnRunWork stops accepting new
-//      completions immediately.
-//   2. Spin-wait (with std::this_thread::yield()) until in_flight_count_ == 0,
-//      meaning all libuv workers that hold a logical reference have finished
-//      pushing their CompletionData and have released their reference.
-//   3. Only then drain the completion queue, release the TSFN, and close the
-//      TF session — in that exact order to avoid use-after-free.
+// Fix 4: replaced napi_delete_reference(nullptr, ...) with env_-based calls.
+//   The stored env_ is set in the constructor and is valid on the JS thread
+//   where cleanup() is guaranteed to run.  Each pending deferred is now
+//   properly rejected so callers receive a "Session destroyed" rejection
+//   rather than a hanging promise.
 //
-// The spin-wait is safe because cleanup() runs on the JS/event-loop thread
-// only (via Destroy() or the GC finalizer), never from a libuv worker.
-// In the worst case the spin lasts for the duration of one TF_SessionRun call
-// already in progress.
+// Fix 6: the spin-wait on in_flight_count_ is now bounded by
+//   CLEANUP_SPIN_TIMEOUT_SEC (30 s).  If TF_SessionRun deadlocks, cleanup()
+//   prints a warning and proceeds rather than freezing the event loop forever.
 // ---------------------------------------------------------------------------
 void SessionWrap::cleanup()
 {
@@ -407,31 +408,51 @@ void SessionWrap::cleanup()
     bool was_alive = false;
     if (!destroyed_.compare_exchange_strong(was_alive, true,
                                             std::memory_order_acq_rel))
-        return; // already cleaned up
+        return;
 
-    // Fix 6: wait for all in-flight OnRunWork callbacks to finish pushing.
-    while (in_flight_count_.load(std::memory_order_acquire) > 0)
-        std::this_thread::yield();
+    // Fix 6: bounded spin-wait — timeout after CLEANUP_SPIN_TIMEOUT_SEC.
+    {
+        using clock = std::chrono::steady_clock;
+        using seconds = std::chrono::seconds;
+        const auto deadline = clock::now() + seconds(CLEANUP_SPIN_TIMEOUT_SEC);
 
-    // Drain any pending completions before releasing the TSFN so their
-    // napi_deferred handles (which hold V8 references) are properly rejected.
+        while (in_flight_count_.load(std::memory_order_acquire) > 0)
+        {
+            if (clock::now() >= deadline)
+            {
+                fprintf(stderr,
+                        "[isidorus] Session::cleanup() timed out after %d s "
+                        "waiting for %d in-flight request(s) — "
+                        "possible TF_SessionRun deadlock\n",
+                        CLEANUP_SPIN_TIMEOUT_SEC,
+                        in_flight_count_.load(std::memory_order_relaxed));
+                break;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    // Drain pending completions.
     {
         std::lock_guard<std::mutex> lg(completion_mu_);
         for (auto *cd : completion_queue_)
         {
-            // We are on the JS thread so we can manipulate napi handles.
-            // Use a raw napi_env from the stored ref if available; otherwise
-            // the deferred will be GC'd harmlessly when V8 shuts down.
-            // For simplicity we just free and let the promise dangle —
-            // the session is being destroyed so no caller should be waiting.
-            napi_delete_reference(nullptr /* env needed */, cd->self_ref);
+            // Fix 4: use stored env_ instead of nullptr (which is UB).
+            // Also properly reject each deferred so callers don't hang.
+            if (env_)
+            {
+                napi_value err_msg, err_obj;
+                napi_create_string_utf8(env_, "Session destroyed",
+                                        NAPI_AUTO_LENGTH, &err_msg);
+                napi_create_error(env_, nullptr, err_msg, &err_obj);
+                napi_reject_deferred(env_, cd->deferred, err_obj);
+                napi_delete_reference(env_, cd->self_ref);
+            }
             delete cd;
         }
         completion_queue_.clear();
     }
 
-    // Fix 3: Release the TSFN only after the queue is drained. This ensures
-    // SessionCompletionCallJs cannot be invoked after we free session state.
     if (completion_tsfn_)
     {
         napi_release_threadsafe_function(completion_tsfn_, napi_tsfn_release);
@@ -571,7 +592,6 @@ Napi::Value SessionWrap::Run(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
-    // Fix 3: check destroyed_ before touching session_.
     if (destroyed_.load(std::memory_order_acquire) || !session_)
     {
         Napi::Error::New(env, "Session destroyed").ThrowAsJavaScriptException();
@@ -674,17 +694,12 @@ static void SessionCompletionCallJs(
         return;
 
     auto *sw = static_cast<SessionWrap *>(context);
-
-    // Fix 3: if destroyed, drain the queue but reject every deferred so
-    // callers don't hang forever.
     bool is_destroyed = sw->destroyed_.load(std::memory_order_acquire);
 
     std::vector<CompletionData *> batch;
     {
         std::lock_guard<std::mutex> lg(sw->completion_mu_);
         batch = std::move(sw->completion_queue_);
-        // completion_queue_ is now empty; subsequent call_js_cb invocations
-        // from the same burst will see an empty queue and return immediately.
     }
 
     Napi::Env n_env(env);
@@ -694,7 +709,9 @@ static void SessionCompletionCallJs(
     {
         if (!cd->ok || is_destroyed)
         {
-            const char *msg = is_destroyed ? "Session destroyed" : cd->error_message.c_str();
+            const char *msg = is_destroyed
+                                  ? "Session destroyed"
+                                  : cd->error_message.c_str();
             napi_value err_msg, error;
             napi_create_string_utf8(env, msg, NAPI_AUTO_LENGTH, &err_msg);
             napi_create_error(env, nullptr, err_msg, &error);
@@ -754,9 +771,6 @@ static void OnRunWork(uv_work_t *req)
 {
     auto *ctx = reinterpret_cast<RunCtx *>(req);
 
-    // Fix 3 + 6: Check destroyed_ before doing any work. If the session was
-    // destroyed while this request was queued, skip TF_SessionRun entirely
-    // and mark the result as an error.
     if (ctx->session_wrap->destroyed_.load(std::memory_order_acquire))
     {
         ctx->ok = false;
@@ -832,11 +846,6 @@ push_completion:
 
     SessionWrap *sw = ctx->session_wrap;
 
-    // Fix 9: enforce the native queue bound. If the queue is full, reject the
-    // deferred directly here on the libuv thread rather than queueing forever.
-    // We cannot call napi_reject_deferred from a non-JS thread, so we mark
-    // the item as an overflow error and still push it; SessionCompletionCallJs
-    // will reject it on the event-loop thread.
     {
         std::lock_guard<std::mutex> lg(sw->completion_mu_);
         if (sw->completion_queue_.size() >= MAX_NATIVE_COMPLETION_QUEUE)
@@ -847,8 +856,6 @@ push_completion:
         sw->completion_queue_.push_back(cd);
     }
 
-    // Fix 6: release our logical reference *before* signalling the TSFN so
-    // cleanup() can safely proceed if it is spin-waiting.
     sw->in_flight_count_.fetch_sub(1, std::memory_order_release);
 
     napi_call_threadsafe_function(sw->completion_tsfn_, nullptr,
@@ -868,7 +875,6 @@ Napi::Value SessionWrap::RunAsync(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
-    // Fix 3: check destroyed_ atomically before queuing work.
     if (destroyed_.load(std::memory_order_acquire) || !session_)
     {
         auto d = Napi::Promise::Deferred::New(env);
@@ -876,10 +882,6 @@ Napi::Value SessionWrap::RunAsync(const Napi::CallbackInfo &info)
         return d.Promise();
     }
 
-    // Create promise + raw deferred handle.
-    // We store raw napi_deferred (not Napi::Promise::Deferred) because the
-    // completion travels to SessionCompletionCallJs via the completion queue
-    // (a C++ struct), which cannot hold Napi++ RAII types safely.
     napi_deferred raw_deferred = nullptr;
     napi_value promise_val = nullptr;
     if (napi_create_promise(env, &raw_deferred, &promise_val) != napi_ok)
@@ -902,8 +904,6 @@ Napi::Value SessionWrap::RunAsync(const Napi::CallbackInfo &info)
     napi_create_reference(env, info.This(), 1, &raw_self_ref);
     ctx->raw_self_ref = raw_self_ref;
 
-    // Fix 6: increment in_flight_count_ *before* queuing work so cleanup()
-    // cannot race ahead and free session state before OnRunWork reads it.
     in_flight_count_.fetch_add(1, std::memory_order_acquire);
 
     std::string error;
