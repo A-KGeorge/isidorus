@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.26
+
+### Patch Changes
+
+- 64f2265: Fix stale prebuild
+
 ## 0.0.0-alpha.25
 
 ### Patch Changes
