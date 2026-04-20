@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.28
+
+### Patch Changes
+
+- 396af7f: Fix postinstall for windows
+
 ## 0.0.0-alpha.27
 
 ### Patch Changes
