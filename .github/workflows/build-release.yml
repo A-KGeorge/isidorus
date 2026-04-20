@@ -1,0 +1,131 @@
+name: Build Release Tarballs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. tensorflow-binaries-v1.0.0)"
+        required: true
+        type: string
+      release_name:
+        description: "Release title"
+        required: true
+        default: "TensorFlow Binaries"
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-macos:
+    name: Build macOS arm64 tarball
+    runs-on: macos-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download TF 2.21.0 wheel (macOS arm64)
+        run: |
+          pip download tensorflow-cpu==2.21.0 \
+            --no-deps \
+            --platform macosx_12_0_arm64 \
+            --python-version 312 \
+            --only-binary=:all: \
+            -d /tmp/tfpip
+
+      - name: Extract and package
+        run: |
+          cd /tmp/tfpip
+          unzip -q *.whl -d tfwheel
+
+          # Verify C API symbols are present
+          DYLIB=$(find tfwheel -name "libtensorflow_cc*.dylib" | sort | head -1)
+          echo "Found: $DYLIB ($(du -sh $DYLIB | cut -f1))"
+          nm -D "$DYLIB" | grep -E "TF_NewSession|TF_NewGraph|TF_Run\b" | head -5
+
+          # Strip debug symbols
+          strip -x "$DYLIB"
+          FRAMEWORK=$(find tfwheel -name "libtensorflow_framework*.dylib" | sort | head -1)
+          strip -x "$FRAMEWORK"
+
+          # Stage with clean symlink structure
+          mkdir -p /tmp/tf-macos-arm64/lib
+
+          cp "$DYLIB"       /tmp/tf-macos-arm64/lib/libtensorflow.2.21.0.dylib
+          cp "$FRAMEWORK"   /tmp/tf-macos-arm64/lib/libtensorflow_framework.2.21.0.dylib
+
+          cd /tmp/tf-macos-arm64/lib
+          ln -s libtensorflow.2.21.0.dylib         libtensorflow.2.dylib
+          ln -s libtensorflow.2.dylib               libtensorflow.dylib
+          ln -s libtensorflow_framework.2.21.0.dylib libtensorflow_framework.2.dylib
+          ln -s libtensorflow_framework.2.dylib      libtensorflow_framework.dylib
+
+          du -sh /tmp/tf-macos-arm64/lib/*
+
+          # Package
+          cd /tmp
+          tar -czf tensorflow-binaries-macos-arm64.tar.gz -C tf-macos-arm64 lib
+
+          echo "SHA256: $(shasum -a 256 tensorflow-binaries-macos-arm64.tar.gz)"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tensorflow-binaries-macos-arm64
+          path: /tmp/tensorflow-binaries-macos-arm64.tar.gz
+          retention-days: 7
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-macos
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tensorflow-binaries-macos-arm64
+          path: ./artifacts
+
+      - name: Compute checksums
+        run: |
+          cd artifacts
+          sha256sum tensorflow-binaries-macos-arm64.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Create release and upload macOS tarball
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.release_name }}
+          prerelease: ${{ inputs.prerelease }}
+          draft: true
+          body: |
+            ## TensorFlow Binaries
+
+            Pre-built TensorFlow shared libraries for `@isidorus/cpu`.
+
+            | Platform | Version | Variant | File |
+            |----------|---------|---------|------|
+            | Linux x86_64 | 2.21.0 | AVX2 + FMA + MKL | `tensorflow-binaries-avx2.tar.gz` |
+            | Linux x86_64 | 2.18.0 | MKL (pre-Haswell) | `tensorflow-binaries-legacy.tar.gz` |
+            | Windows x64 | 2.21.0 | AVX2 + MKL | `tensorflow-binaries-windows-avx2.tar.gz` |
+            | macOS arm64 | 2.21.0 | Standard | `tensorflow-binaries-macos-arm64.tar.gz` |
+
+            ### Checksums (SHA256)
+            See `checksums.txt` for macOS. Update `postinstall.mjs` with the
+            checksums for all manually uploaded tarballs before publishing.
+
+            ### ⚠️ Draft — upload remaining tarballs before publishing
+            Upload these files via the GitHub UI before publishing this release:
+            - `tensorflow-binaries-avx2.tar.gz` (Linux AVX2)
+            - `tensorflow-binaries-legacy.tar.gz` (Linux legacy)
+            - `tensorflow-binaries-windows-avx2.tar.gz` (Windows AVX2)
+          files: |
+            artifacts/tensorflow-binaries-macos-arm64.tar.gz
+            artifacts/checksums.txt

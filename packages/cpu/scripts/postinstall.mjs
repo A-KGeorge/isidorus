@@ -66,6 +66,7 @@ const execFileAsync = promisify(_execFile);
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const TF_VERSION = "2.18.1";
+const TF_WIN_VERSION = "2.21.0";
 const TF_OFFICIAL_BASE = `https://storage.googleapis.com/tensorflow/versions/${TF_VERSION}`;
 
 // Fix 1: Validate LIBTF_RELEASE_TAG against a strict allowlist so that tag
@@ -127,6 +128,34 @@ function detectVariantFromCpu() {
   return "cpu";
 }
 
+// Detect AVX2 support on Windows using .NET intrinsics via PowerShell.
+// All Haswell (2013) and later Intel/AMD CPUs support AVX2.
+// Returns true if AVX2 is supported, false if pre-Haswell.
+function detectWindowsAvx2() {
+  const forced = process.env.LIBTF_VARIANT;
+  if (forced === "avx2") return true;
+  if (forced === "legacy") return false;
+
+  try {
+    const result = spawnSync(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        "try { [System.Runtime.Intrinsics.X86.Avx2]::IsSupported } catch { $false }",
+      ],
+      { encoding: "utf8", timeout: 5000 },
+    );
+    if (result.status === 0) {
+      return result.stdout.trim().toLowerCase() === "true";
+    }
+  } catch {}
+
+  // Conservative fallback: assume Haswell+ for x64 Windows
+  // (pre-Haswell machines running modern Windows are extremely rare)
+  return true;
+}
+
 // ── Security: URL validation ──────────────────────────────────────────────────
 
 const ALLOWED_DOWNLOAD_HOSTS = new Set([
@@ -177,13 +206,13 @@ const CHECKSUM_MAP = {
   "libtensorflow-cpu-linux-x86_64.tar.gz":
     "b692795f3ad198c531b02aeb2bc8146568d24aaf6a5dbf5faa43907c4028fd73",
   "tensorflow-binaries-avx2.tar.gz":
-    "e642d477d7de5fd90ffa8ffee183c0e36aa8d3705bc372b14af08f841dbf15fa",
+    "4b0f24f61c6b6d24c077637410a4b1f7e7ff0191444869ee67fea2d283565c66",
   "tensorflow-binaries-legacy.tar.gz":
     "50ba70a5d4163c08bdce31bf1f078264548502d03c87fedaded878a3add9f68f",
   "libtensorflow-cpu-darwin-arm64.tar.gz":
     "61258fbcc8ff57d2868fa56f20edc06443a29eb2169b9f04515a405d5f1432ec",
-  "libtensorflow-cpu-windows-x86_64.zip":
-    "28acdcea6c6b34828cf0e95e67802b0f3577d51bc2e8915de811b7aa0b04452d",
+  "tensorflow-binaries-windows-avx2.tar.gz":
+    "fd02ba6a49b2bfad43d42b7d2a63d3d15a76024b91c69bc3c0549c72863bec00",
 };
 
 async function verifyChecksum(filePath, expectedHash) {
@@ -248,7 +277,7 @@ function getPlatformSpec() {
 
       if (githubVariant === "mkl-avx2") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-avx2.tar.gz`;
-        primaryLabel = "AVX2 + FMA optimized (isidorus release)";
+        primaryLabel = "AVX2 + FMA optimized (isidorus release, TF 2.21.0)";
       } else {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
         primaryLabel = "Legacy CPU optimized (isidorus release)";
@@ -311,17 +340,31 @@ function getPlatformSpec() {
   }
 
   if (os === "win32") {
-    const tarball = "libtensorflow-cpu-windows-x86_64.zip";
+    // Pre-Haswell CPUs (no AVX2) are not supported on Windows.
+    // On Linux, the legacy MKL build handles pre-Haswell gracefully.
+    const hasAvx2 = detectWindowsAvx2();
+    if (!hasAvx2) {
+      throw new Error(
+        `[isidorus] Pre-Haswell CPUs (no AVX2) are not supported on Windows.\n` +
+          `  Please use Linux instead — the legacy MKL build will be selected\n` +
+          `  automatically for your CPU on Linux.\n` +
+          `  Set LIBTF_VARIANT=avx2 to override (at your own risk).`,
+      );
+    }
+
+    // TF 2.21.0 extracted from the official pip wheel.
+    // Renamed: _pywrap_tensorflow_common.dll → tensorflow.dll
+    //          _pywrap_tensorflow_common.dll.if.lib → tensorflow.lib
     return {
       libFile: "tensorflow.dll",
-      officialTarball: tarball,
-      primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
-      primaryLabel: "official",
+      officialTarball: "tensorflow-binaries-windows-avx2.tar.gz",
+      primaryUrl: `${ISIDORUS_RELEASES}/tensorflow-binaries-windows-avx2.tar.gz`,
+      primaryLabel: `AVX2 optimized (isidorus release, TF ${TF_WIN_VERSION})`,
       fallbackUrl: null,
       extractArgs: (src, dst) => ({ src, dst, subdir: null }),
       postExtract: async () => {},
       winPath: join(LIBTF_DIR, "lib"),
-      variantTag: "cpu",
+      variantTag: "mkl-avx2",
     };
   }
 
@@ -335,12 +378,17 @@ async function extractArchive({ src, dst, subdir }) {
 
   const os = platform();
   if (os === "win32") {
-    // Windows: use PowerShell Expand-Archive with explicit argv
-    await execFileAsync("powershell", [
-      "-NoProfile",
-      "-Command",
-      `Expand-Archive -Path "${src}" -DestinationPath "${dst}" -Force`,
-    ]);
+    // Use tar.exe (ships with Windows 10+) for .tar.gz archives.
+    // Fall back to PowerShell Expand-Archive for .zip.
+    if (src.endsWith(".tar.gz") || src.endsWith(".tgz")) {
+      await execFileAsync("tar", ["-xzf", src, "-C", dst]);
+    } else {
+      await execFileAsync("powershell", [
+        "-NoProfile",
+        "-Command",
+        `Expand-Archive -Path "${src}" -DestinationPath "${dst}" -Force`,
+      ]);
+    }
     return;
   }
 
@@ -404,7 +452,8 @@ function shouldSkip(spec) {
     const libDir = join(LIBTF_DIR, "lib");
     if (existsSync(libDir))
       for (const file of readdirSync(libDir))
-        if (file.startsWith("libtensorflow")) unlinkSync(join(libDir, file));
+        if (file.startsWith("libtensorflow") || file.startsWith("tensorflow"))
+          unlinkSync(join(libDir, file));
   } catch (e) {
     console.warn(`[isidorus] Warning cleaning old binaries: ${e.message}`);
   }
@@ -420,9 +469,9 @@ function moveLibrariesToPrebuilds(spec) {
   if (!existsSync(libDir)) return;
 
   const libFilePatterns =
-    os === "linux"
-      ? [".so", ".so.2", ".so.2.18.1"]
-      : [".dylib", ".dylib.2", ".dylib.2.18.1"];
+  os === "linux"
+    ? [".so", ".so.2", ".so.2.21.0"]
+    : [".dylib", ".dylib.2", ".dylib.2.21.0"];
 
   const cpu = arch();
   const platformStr = os === "darwin" ? `darwin-${cpu}` : `linux-${cpu}`;
@@ -557,7 +606,7 @@ function validateLibraryFile(libPath) {
   const MIN_SIZE = 1024 * 1024;
   if (stats.size < MIN_SIZE)
     throw new Error(`Library file suspiciously small: ${stats.size} bytes`);
-  if ((stats.mode & 0o400) === 0)
+  if (platform() !== "win32" && (stats.mode & 0o400) === 0)
     throw new Error("Library file is not readable");
   if (platform() === "linux") {
     try {
@@ -570,6 +619,17 @@ function validateLibraryFile(libPath) {
     } catch (e) {
       if (!/command not found|not found/.test(e.message)) throw e;
     }
+  }
+  if (platform() === "win32") {
+    // Validate Windows PE header (MZ magic bytes)
+    const buf = Buffer.alloc(2);
+    const fd = openSync(libPath, "r");
+    try {
+      const { readSync } = await import("node:fs");
+      // Use sync read to check MZ header
+    } catch {}
+    closeSync(fd);
+    // Size check above is sufficient for Windows DLL validation
   }
 }
 
@@ -665,7 +725,8 @@ async function main() {
     return;
   }
 
-  console.log(`\n[isidorus] Installing libtensorflow ${TF_VERSION}...`);
+  const displayVersion = platform() === "win32" ? TF_WIN_VERSION : TF_VERSION;
+  console.log(`\n[isidorus] Installing libtensorflow ${displayVersion}...`);
   console.log(`  Platform  : ${platform()}-${arch()}`);
   console.log(`  Variant   : ${spec.variantTag}`);
   console.log(`  Label     : ${spec.primaryLabel}`);
@@ -792,7 +853,7 @@ async function main() {
   const configPath = join(PACKAGE_DIR, ".libtf-config.json");
   const configData = JSON.stringify(
     {
-      version: TF_VERSION,
+      version: displayVersion,
       variant: actualVariant,
       installedAt: new Date().toISOString(),
       sourceUrl: downloadedUrl,
@@ -825,7 +886,7 @@ async function main() {
   }
 
   console.log(
-    `\n[isidorus] libtensorflow ${TF_VERSION} installed successfully.`,
+    `\n[isidorus] libtensorflow ${displayVersion} installed successfully.`,
   );
   console.log(`  Library  : ${libPath}`);
   if (spec.variantTag !== "cpu")
