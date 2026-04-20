@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.27
+
+### Patch Changes
+
+- b92eedf: Fix prebuilds
+
 ## 0.0.0-alpha.26
 
 ### Patch Changes
