@@ -128,31 +128,44 @@ function detectVariantFromCpu() {
   return "cpu";
 }
 
-// Detect AVX2 support on Windows using .NET intrinsics via PowerShell.
-// All Haswell (2013) and later Intel/AMD CPUs support AVX2.
-// Returns true if AVX2 is supported, false if pre-Haswell.
+// Detect AVX2 support on Windows via CPU name heuristics.
+// All AMD Ryzen and Intel 4th gen (Haswell, 2013) and later support AVX2.
+// Uses wmic (available on all Windows versions) to read the CPU name.
+// Returns true if AVX2 is supported, false if definitively pre-Haswell.
 function detectWindowsAvx2() {
   const forced = process.env.LIBTF_VARIANT;
   if (forced === "avx2") return true;
   if (forced === "legacy") return false;
 
   try {
-    const result = spawnSync(
-      "powershell",
-      [
-        "-NoProfile",
-        "-Command",
-        "try { [System.Runtime.Intrinsics.X86.Avx2]::IsSupported } catch { $false }",
-      ],
-      { encoding: "utf8", timeout: 5000 },
-    );
-    if (result.status === 0) {
-      return result.stdout.trim().toLowerCase() === "true";
+    const result = spawnSync("wmic", ["cpu", "get", "Name", "/value"], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    if (result.status === 0 && result.stdout) {
+      const name = result.stdout.toLowerCase();
+      // AMD Ryzen (all generations), EPYC, Threadripper — all have AVX2
+      if (
+        name.includes("ryzen") ||
+        name.includes("epyc") ||
+        name.includes("threadripper")
+      ) {
+        return true;
+      }
+      // Intel: Haswell is i-4xxx, Broadwell i-5xxx, Skylake i-6xxx, etc.
+      // Pre-Haswell (Sandy Bridge i-2xxx, Ivy Bridge i-3xxx) lack AVX2.
+      const ivyOrSandy = /core.*(i[3579]-[23]\d{3}|i[3579] [23]\d{3})/i;
+      if (ivyOrSandy.test(result.stdout)) return false;
+      // Intel Xeon E3/E5 pre-v3 (Ivy Bridge era) also lack AVX2
+      const oldXeon = /xeon.*e[35]-[12]\d{3}/i;
+      if (oldXeon.test(result.stdout)) return false;
+      // Anything else (including unrecognized CPUs): assume Haswell+
+      // Pre-Haswell machines running Windows 11 are essentially nonexistent
+      return true;
     }
   } catch {}
 
-  // Conservative fallback: assume Haswell+ for x64 Windows
-  // (pre-Haswell machines running modern Windows are extremely rare)
+  // If wmic fails entirely, assume modern CPU
   return true;
 }
 
@@ -275,7 +288,7 @@ function getPlatformSpec() {
 
       if (githubVariant === "mkl-avx2") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-avx2.tar.gz`;
-        primaryLabel = "AVX2 + FMA optimized (isidorus release, TF 2.21.0)";
+        primaryLabel = "AVX2 + FMA optimized (isidorus release)";
       } else {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
         primaryLabel = "Legacy CPU optimized (isidorus release)";
@@ -467,9 +480,9 @@ function moveLibrariesToPrebuilds(spec) {
   if (!existsSync(libDir)) return;
 
   const libFilePatterns =
-  os === "linux"
-    ? [".so", ".so.2", ".so.2.21.0"]
-    : [".dylib", ".dylib.2", ".dylib.2.21.0"];
+    os === "linux"
+      ? [".so", ".so.2", ".so.2.18.1"]
+      : [".dylib", ".dylib.2", ".dylib.2.18.1"];
 
   const cpu = arch();
   const platformStr = os === "darwin" ? `darwin-${cpu}` : `linux-${cpu}`;
@@ -618,17 +631,7 @@ function validateLibraryFile(libPath) {
       if (!/command not found|not found/.test(e.message)) throw e;
     }
   }
-  if (platform() === "win32") {
-    // Validate Windows PE header (MZ magic bytes)
-    const buf = Buffer.alloc(2);
-    const fd = openSync(libPath, "r");
-    try {
-      const { readSync } = await import("node:fs");
-      // Use sync read to check MZ header
-    } catch {}
-    closeSync(fd);
-    // Size check above is sufficient for Windows DLL validation
-  }
+  // On Windows, the size check above is sufficient for DLL validation.
 }
 
 // ── Fix 13: atomic config write ───────────────────────────────────────────────
