@@ -203,10 +203,8 @@ function validateDownloadUrl(urlString) {
 // of the URL), not spec.tarball. For isidorus custom releases the tarball
 // name differs from the official one, so the old key lookup always missed.
 const CHECKSUM_MAP = {
-  "libtensorflow-cpu-linux-x86_64.tar.gz":
-    "b692795f3ad198c531b02aeb2bc8146568d24aaf6a5dbf5faa43907c4028fd73",
   "tensorflow-binaries-avx2.tar.gz":
-    "4b0f24f61c6b6d24c077637410a4b1f7e7ff0191444869ee67fea2d283565c66",
+    "913bae9530bf003e2b4164402ade5c0f4280818dddbce853caae5fb795c08b89",
   "tensorflow-binaries-legacy.tar.gz":
     "50ba70a5d4163c08bdce31bf1f078264548502d03c87fedaded878a3add9f68f",
   "libtensorflow-cpu-darwin-arm64.tar.gz":

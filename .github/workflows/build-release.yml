@@ -30,7 +30,20 @@ jobs:
 
       - name: Download TF 2.21.0 wheel (macOS arm64)
         run: |
-          pip download tensorflow-cpu==2.21.0 \
+          pip download tensorflow==2.21.0 \
+            --no-deps \
+            --platform macosx_14_0_arm64 \
+            --python-version 312 \
+            --only-binary=:all: \
+            -d /tmp/tfpip || \
+          # Try 14_0 first (macos-latest is M1/macOS 14), fall back to 12_0
+          pip download tensorflow==2.21.0 \
+            --no-deps \
+            --platform macosx_14_0_arm64 \
+            --python-version 312 \
+            --only-binary=:all: \
+            -d /tmp/tfpip || \
+          pip download tensorflow==2.21.0 \
             --no-deps \
             --platform macosx_12_0_arm64 \
             --python-version 312 \
