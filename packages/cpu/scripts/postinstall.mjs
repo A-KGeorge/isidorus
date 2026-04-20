@@ -207,8 +207,8 @@ const CHECKSUM_MAP = {
     "913bae9530bf003e2b4164402ade5c0f4280818dddbce853caae5fb795c08b89",
   "tensorflow-binaries-legacy.tar.gz":
     "50ba70a5d4163c08bdce31bf1f078264548502d03c87fedaded878a3add9f68f",
-  "libtensorflow-cpu-darwin-arm64.tar.gz":
-    "61258fbcc8ff57d2868fa56f20edc06443a29eb2169b9f04515a405d5f1432ec",
+  "tensorflow-binaries-macos-arm64.tar.gz":
+    "6359061c26db3d04c8fe2d2f9f98536af39309fe4f7167d847855a02bbd450ce",
   "tensorflow-binaries-windows-avx2.tar.gz":
     "fd02ba6a49b2bfad43d42b7d2a63d3d15a76024b91c69bc3c0549c72863bec00",
 };
