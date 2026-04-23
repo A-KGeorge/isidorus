@@ -235,9 +235,10 @@ function getPlatformSpec() {
     const officialTarball = `libtensorflow-cpu-linux-${archStr}.tar.gz`;
     const officialUrl = `${TF_OFFICIAL_BASE}/${officialTarball}`;
 
-    // Start with GitHub releases as primary for x64 (Intel/AMD)
+    // Linux x64: fetch optimized variants (legacy, avx2) from GitHub releases.
+    // Fallback to official TensorFlow.org if GitHub unavailable.
     let primaryUrl = officialUrl;
-    let primaryLabel = "official";
+    let primaryLabel = "official TensorFlow.org";
     let variantTag = "cpu";
     let fallbackUrl = null;
 
@@ -246,15 +247,18 @@ function getPlatformSpec() {
       variantTag = detectLinuxVariant();
       let githubVariant = variantTag === "cpu" ? "mkl" : variantTag;
 
+      // Fetch from GitHub releases for CPU-optimized variants
       if (githubVariant === "mkl-avx2") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-avx2.tar.gz`;
-        primaryLabel = "AVX2 + FMA optimized (isidorus release)";
-      } else {
+        primaryLabel = "AVX2 + FMA optimized (GitHub)";
+      } else if (githubVariant === "mkl") {
         primaryUrl = `${ISIDORUS_RELEASES}/tensorflow-binaries-legacy.tar.gz`;
-        primaryLabel = "Legacy CPU optimized (isidorus release)";
+        primaryLabel = "Legacy CPU optimized (GitHub)";
       }
-      // Set official as fallback if GitHub releases unavailable
-      fallbackUrl = officialUrl;
+      // Set official TensorFlow.org as fallback if GitHub releases unavailable
+      if (githubVariant !== "cpu") {
+        fallbackUrl = officialUrl;
+      }
     }
 
     return {
@@ -291,6 +295,7 @@ function getPlatformSpec() {
   }
 
   if (os === "darwin") {
+    // macOS arm64: fetch from official TensorFlow.org only
     const archStr = cpu === "arm64" ? "arm64" : "x86_64";
     if (archStr === "x86_64")
       throw new Error(
@@ -301,7 +306,7 @@ function getPlatformSpec() {
       libFile: "libtensorflow.dylib",
       officialTarball: tarball,
       primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
-      primaryLabel: "official",
+      primaryLabel: "official TensorFlow.org",
       fallbackUrl: null,
       extractArgs: (src, dst) => ({ src, dst, subdir: null }),
       postExtract: async () => {},
@@ -311,12 +316,13 @@ function getPlatformSpec() {
   }
 
   if (os === "win32") {
+    // Windows x64: fetch from official TensorFlow.org only
     const tarball = "libtensorflow-cpu-windows-x86_64.zip";
     return {
       libFile: "tensorflow.dll",
       officialTarball: tarball,
       primaryUrl: `${TF_OFFICIAL_BASE}/${tarball}`,
-      primaryLabel: "official",
+      primaryLabel: "official TensorFlow.org",
       fallbackUrl: null,
       extractArgs: (src, dst) => ({ src, dst, subdir: null }),
       postExtract: async () => {},

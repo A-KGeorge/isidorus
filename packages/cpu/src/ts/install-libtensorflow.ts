@@ -130,14 +130,38 @@ export async function ensureTf(): Promise<string> {
   if (resolved) {
     process.env["LIBTENSORFLOW_PATH"] = resolved.tfPath;
 
-    // Inject the lib folder into the current process PATH on Windows so
-    // the OS loader can find tensorflow.dll when the .node addon is required.
-    // This avoids requiring the user to restart their terminal after install.
+    // Inject the lib folder into the runtime library search paths so the OS
+    // loader can find TensorFlow shared libraries when the .node addon is required.
+    // This avoids requiring the user to manually set environment variables.
+    const libDir = join(resolved.tfPath, "lib");
+
     if (platform() === "win32") {
-      const libDir = join(resolved.tfPath, "lib");
+      // Windows: prepend to PATH for tensorflow.dll
       const currentPath = process.env.PATH || "";
       if (!currentPath.toLowerCase().includes(libDir.toLowerCase())) {
         process.env.PATH = `${libDir};${currentPath}`;
+      }
+    } else if (platform() === "linux") {
+      // Linux: prepend to LD_LIBRARY_PATH for libtensorflow.so
+      const currentLdPath = process.env.LD_LIBRARY_PATH || "";
+      if (!currentLdPath.includes(libDir)) {
+        process.env.LD_LIBRARY_PATH = currentLdPath
+          ? `${libDir}:${currentLdPath}`
+          : libDir;
+      }
+    } else if (platform() === "darwin") {
+      // macOS: prepend to both LD_LIBRARY_PATH and DYLD_LIBRARY_PATH for libtensorflow.dylib
+      const currentLdPath = process.env.LD_LIBRARY_PATH || "";
+      if (!currentLdPath.includes(libDir)) {
+        process.env.LD_LIBRARY_PATH = currentLdPath
+          ? `${libDir}:${currentLdPath}`
+          : libDir;
+      }
+      const currentDyldPath = process.env.DYLD_LIBRARY_PATH || "";
+      if (!currentDyldPath.includes(libDir)) {
+        process.env.DYLD_LIBRARY_PATH = currentDyldPath
+          ? `${libDir}:${currentDyldPath}`
+          : libDir;
       }
     }
 

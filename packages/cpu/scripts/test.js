@@ -25,18 +25,11 @@ const args = [
 const env = { ...process.env };
 
 // Suppress TensorFlow startup messages (oneDNN, CPU features, MLIR optimization).
-// Level 2 filters out INFO and WARNING; set TF_CPP_MIN_LOG_LEVEL=0 to restore.
-env.TF_CPP_MIN_LOG_LEVEL = "3";
-
-if (process.platform === "win32") {
-  const libtfPath = env.LIBTENSORFLOW_PATH || "C:\\libtensorflow";
-  const dllDir = libtfPath.toLowerCase().endsWith("\\lib")
-    ? libtfPath
-    : join(libtfPath, "lib");
-  const currentPath = env.Path || env.PATH || "";
-  const nextPath = `${dllDir};${currentPath}`;
-  env.Path = nextPath;
-  env.PATH = nextPath;
+// Level 3 filters out all messages. Set TF_CPP_MIN_LOG_LEVEL=0 to restore.
+// The library automatically configures LD_LIBRARY_PATH and other platform-specific
+// environment variables on import, so no manual setup needed here.
+if (!env.TF_CPP_MIN_LOG_LEVEL) {
+  env.TF_CPP_MIN_LOG_LEVEL = "3";
 }
 
 const child = spawn("node", args, {
