@@ -145,14 +145,14 @@ describe("Native Module Loading", () => {
     // The key test: verify that ensureTf exists and is callable.
     // We import it normally (not dynamically to avoid serialization issues)
     // and verify it can be called without throwing uncaught exceptions.
-    
+
     // We're testing the actual behavior: that the module can be imported
     // and the library resolution function is available and works.
     const { ensureTf } = await import("../install-libtensorflow.js");
-    
+
     assert.ok(typeof ensureTf === "function");
     console.log("✓ ensureTf is callable and module loaded successfully");
-    
+
     // Try calling it - it may fail if TensorFlow isn't installed,
     // but the failure should be clean (not a symbol lookup error)
     try {
@@ -164,8 +164,9 @@ describe("Native Module Loading", () => {
       const message = (error as Error).message;
       assert.ok(
         !message.includes("undefined symbol"),
-        "Should not have symbol lookup errors"
+        "Should not have symbol lookup errors",
       );
       console.log(`✓ ensureTf() error is clean: ${message.split("\n")[0]}`);
     }
   });
+});
