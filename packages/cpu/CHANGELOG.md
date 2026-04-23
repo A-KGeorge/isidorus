@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.29
+
+### Patch Changes
+
+- 9c19ab1: version bump
+
 ## 0.0.0-alpha.27
 
 ### Patch Changes
