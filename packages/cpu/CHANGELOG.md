@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.30
+
+### Patch Changes
+
+- 93d6abe: Fix preload, add zero-copy fixes
+
 ## 0.0.0-alpha.29
 
 ### Patch Changes
