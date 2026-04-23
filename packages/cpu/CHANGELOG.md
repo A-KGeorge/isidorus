@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.27
+
+### Patch Changes
+
+- d9877d5: Revert back to 2.18.0
+
 ## 0.0.0-alpha.26
 
 ### Patch Changes
