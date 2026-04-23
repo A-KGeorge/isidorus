@@ -16,7 +16,7 @@
 
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { platform } from "os";
+import { platform, arch } from "os";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import { debug, warn } from "./_log.js";
@@ -72,7 +72,26 @@ async function resolveTfPath(): Promise<{
     return null;
   }
 
-  // 2. Package-local libtf/ (installed by scripts/install.mjs).
+  // 2a. Package-local prebuilds directory (where postinstall moves libraries).
+  // This takes precedence over libtf/ since the .node addon has $$ORIGIN rpath.
+  const os = platform();
+  const cpu = arch();
+  const prebuildsDir =
+    os === "darwin"
+      ? join(PACKAGE_ROOT, "prebuilds", `darwin-${cpu}`)
+      : os === "linux"
+      ? join(PACKAGE_ROOT, "prebuilds", `linux-${cpu}`)
+      : null;
+
+  if (prebuildsDir && existsSync(prebuildsDir)) {
+    const libPath = join(prebuildsDir, libFile);
+    if (existsSync(libPath)) {
+      debug(`Found ${libFile} in prebuilds: ${prebuildsDir}`);
+      return { tfPath: prebuildsDir, source: "prebuilds directory" };
+    }
+  }
+
+  // 2b. Package-local libtf/ (installed by scripts/install.mjs or via symlinks).
   const localLibtf = join(PACKAGE_ROOT, "libtf");
   if (checkDir(localLibtf, libFile)) {
     debug(`Found ${libFile} in ${localLibtf}`);
@@ -130,10 +149,17 @@ export async function ensureTf(): Promise<string> {
   if (resolved) {
     process.env["LIBTENSORFLOW_PATH"] = resolved.tfPath;
 
-    // Inject the lib folder into the runtime library search paths so the OS
-    // loader can find TensorFlow shared libraries when the .node addon is required.
-    // This avoids requiring the user to manually set environment variables.
-    const libDir = join(resolved.tfPath, "lib");
+    // Inject the library directory into runtime library search paths.
+    // For different directory layouts, we need to handle both:
+    //   - Traditional: libdir/libtensorflow.so (e.g., /usr/local/lib)
+    //   - Prebuilds: prebuilds/linux-x64/libtensorflow.so
+    const possibleLibDirs = [
+      join(resolved.tfPath, "lib"), // Check lib/ subdirectory first
+      resolved.tfPath, // Check directory itself
+    ];
+
+    const libDir =
+      possibleLibDirs.find((dir) => existsSync(dir)) || resolved.tfPath;
 
     if (platform() === "win32") {
       // Windows: prepend to PATH for tensorflow.dll
@@ -176,9 +202,14 @@ export async function ensureTf(): Promise<string> {
   throw new Error(
     `[isidorus] libtensorflow not found.\n\n` +
       `  The postinstall script (scripts/install.mjs) should have downloaded it\n` +
-      `  to ${join(PACKAGE_ROOT, "libtf")}. If that failed, you can:\n\n` +
+      `  to ${join(PACKAGE_ROOT, "libtf")} or ${join(
+        PACKAGE_ROOT,
+        "prebuilds",
+        platform() === "darwin" ? `darwin-${arch()}` : `linux-${arch()}`,
+      )}\n` +
+      `  If that failed, you can:\n\n` +
       `  Option A — re-run the install script:\n` +
-      `    node node_modules/@isidorus/cpu/scripts/install.mjs\n\n` +
+      `    node node_modules/@isidorus/cpu/scripts/postinstall.mjs\n\n` +
       `  Option B — install manually and set LIBTENSORFLOW_PATH:\n` +
       (isWin
         ? `    Download: https://storage.googleapis.com/tensorflow/versions/2.18.1/libtensorflow-cpu-windows-x86_64.zip\n` +

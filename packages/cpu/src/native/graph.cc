@@ -622,9 +622,13 @@ Napi::Value GraphWrap::ToGraphDef(const Napi::CallbackInfo &info)
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    auto node_buf = Napi::Buffer<uint8_t>::Copy(
-        env, reinterpret_cast<const uint8_t *>(buf->data), buf->length);
-    TF_DeleteBuffer(buf);
+    auto node_buf = Napi::Buffer<uint8_t>::New(
+        env,
+        reinterpret_cast<uint8_t *>(const_cast<void *>(buf->data)),
+        buf->length,
+        [](Napi::Env, uint8_t *, TF_Buffer *b)
+        { TF_DeleteBuffer(b); },
+        buf);
     return node_buf;
 }
 

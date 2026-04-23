@@ -768,9 +768,11 @@ async function main() {
 
   if (platform() === "linux") {
     try {
-      const libDir = join(LIBTF_DIR, "lib");
+      // On Linux, keep libtf/lib intact so symlinks to prebuilds work.
+      // The .node file is built with $$ORIGIN rpath, so it can find libraries
+      // next to it in prebuilds/. The symlinks in libtf/lib ensure the runtime
+      // loader can also find them if LD_LIBRARY_PATH is set.
       const includeDir = join(LIBTF_DIR, "include");
-      if (existsSync(libDir)) rmSync(libDir, { recursive: true, force: true });
       if (existsSync(includeDir))
         rmSync(includeDir, { recursive: true, force: true });
     } catch (e) {

@@ -2,12 +2,26 @@
 
 High-performance TensorFlow CPU backend for Isidorus, enabling graph construction, training, and inference in Node.js environments.
 
+## Why a Native Addon?
+
+Integrating TensorFlow with Node.js isn't just about bindings—it's about solving fundamental scheduling conflicts:
+
+- **libuv's Thread Pool** (Node.js event loop) and **TensorFlow's Scheduler** both compete for limited CPU resources
+- Naive NAPI async worker wrapping leads to thread over-subscription, cache thrashing, and degraded latency
+- This package uses intelligent request queueing with `uv_queue_work` to serialize inference and prevent scheduler conflicts
+- The `reserveCores` option lets you control TensorFlow's resource usage relative to your event loop
+
+The result: predictable latency and stable throughput, even under heavy inference load.
+
+See the [main Isidorus README](../README.md#why-isidorus) for more context on the threading challenges this solves.
+
 ## Features
 
 - **Native Addon**: Uses a C++ native addon to interface directly with `libtensorflow`.
 - **Automatic Setup**: Automatically handles the download and installation of required TensorFlow libraries.
 - **Inference Pool**: Efficiently manage concurrent execution strategies (worker-pool vs tf-parallel).
 - **Ops Library**: Rich set of operations including Math, Array, NN, and Variable ops.
+- **Smart Threading**: Avoids scheduler conflicts through coordinated resource management between libuv and TensorFlow threads.
 
 ## Installation
 

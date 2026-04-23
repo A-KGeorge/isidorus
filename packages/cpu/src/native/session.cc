@@ -225,7 +225,7 @@ bool affinity_set(AffinityMask mask)
 
 struct PackedOutput
 {
-    std::vector<uint8_t> data;
+    TF_Tensor *tensor;
     int32_t dtype;
     std::vector<int64_t> shape;
 };
@@ -577,10 +577,15 @@ static Napi::Array pack_outputs(Napi::Env env,
             shape.Set(j, Napi::Number::New(env, static_cast<double>(TF_Dim(t, j))));
         obj.Set("shape", shape);
 
-        auto buf = Napi::Buffer<uint8_t>::Copy(
-            env, reinterpret_cast<const uint8_t *>(TF_TensorData(t)), nb);
+        auto buf = Napi::Buffer<uint8_t>::New(
+            env,
+            reinterpret_cast<uint8_t *>(TF_TensorData(t)),
+            nb,
+            [](Napi::Env, uint8_t *, TF_Tensor *tensor)
+            { TF_DeleteTensor(tensor); },
+            t);
         obj.Set("data", buf);
-        TF_DeleteTensor(t);
+
         result.Set(i, obj);
     }
     return result;
@@ -745,16 +750,15 @@ static void SessionCompletionCallJs(
                 }
                 napi_set_named_property(env, obj, "shape", shape_arr);
 
-                // Transfer ownership of po.data to the Buffer finalizer.
-                auto *heap_vec = new std::vector<uint8_t>(std::move(po.data));
                 napi_value buf;
                 napi_create_external_buffer(
-                    env, heap_vec->size(), heap_vec->data(),
+                    env, TF_TensorByteSize(po.tensor), TF_TensorData(po.tensor),
                     [](napi_env, void *, void *hint)
                     {
-                        delete static_cast<std::vector<uint8_t> *>(hint);
+                        TF_DeleteTensor(static_cast<TF_Tensor *>(hint));
                     },
-                    heap_vec, &buf);
+                    po.tensor, &buf);
+
                 napi_set_named_property(env, obj, "data", buf);
                 napi_set_element(env, result, static_cast<uint32_t>(i), obj);
             }
@@ -816,16 +820,12 @@ static void OnRunWork(uv_work_t *req)
             for (auto *t : ctx->output_tensors)
             {
                 PackedOutput po;
+                po.tensor = t;
                 po.dtype = static_cast<int32_t>(TF_TensorType(t));
                 int ndims = TF_NumDims(t);
                 po.shape.reserve(ndims);
                 for (int j = 0; j < ndims; ++j)
                     po.shape.push_back(TF_Dim(t, j));
-                size_t nb = TF_TensorByteSize(t);
-                po.data.resize(nb);
-                std::memcpy(po.data.data(),
-                            reinterpret_cast<const uint8_t *>(TF_TensorData(t)), nb);
-                TF_DeleteTensor(t);
                 ctx->packed_outputs.push_back(std::move(po));
             }
             ctx->output_tensors.clear();

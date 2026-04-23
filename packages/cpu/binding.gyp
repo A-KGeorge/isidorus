@@ -58,6 +58,7 @@
         ["OS=='linux'", {
           "ldflags": [
             "-Wl,-rpath,'$$ORIGIN'",
+            "-Wl,-rpath,'$$ORIGIN/../../../prebuilds/linux-x64'",
             "-Wl,-rpath,/usr/local/lib",
             "-Wl,-rpath,<!@(echo $LIBTENSORFLOW_PATH || echo /usr/local || true)/lib"
           ]
