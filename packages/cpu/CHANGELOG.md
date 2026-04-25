@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.31
+
+### Patch Changes
+
+- 2855b42: Fix DType passing
+
 ## 0.0.0-alpha.30
 
 ### Patch Changes
