@@ -134,7 +134,7 @@ interface QueueEntry {
 export class InferencePool {
   private readonly graph: Graph;
   private readonly sess: Session;
-  private readonly inputOp: string;
+  private readonly inputOps: string[];
   private readonly outputOps: string[];
   private readonly maxQueueDepth: number;
   private readonly _inputShape: (number | null)[];
@@ -149,7 +149,7 @@ export class InferencePool {
   private constructor(params: {
     graph: Graph;
     sess: Session;
-    inputOp: string;
+    inputOps: string[];
     outputOps: string[];
     maxQueueDepth: number;
     maxConcurrent: number;
@@ -159,7 +159,7 @@ export class InferencePool {
   }) {
     this.graph = params.graph;
     this.sess = params.sess;
-    this.inputOp = params.inputOp;
+    this.inputOps = params.inputOps;
     this.outputOps = params.outputOps;
     this.maxQueueDepth = params.maxQueueDepth;
     this.maxConcurrent = params.maxConcurrent;
@@ -178,16 +178,16 @@ export class InferencePool {
     const modelBytes = statSync(opts.modelPath).size;
     g.importGraphDef(readFileSync(opts.modelPath));
 
-    // Auto-discover inputOp and outputOps.
-    let inputOp = opts.inputOp;
+    // Auto-discover inputOps and outputOps.
+    let inputOps = opts.inputOp ? [opts.inputOp] : undefined;
     let outputOps = opts.outputOps?.slice();
 
-    if (!inputOp || !outputOps?.length) {
-      if (!inputOp) {
+    if (!inputOps || !outputOps?.length) {
+      if (!inputOps) {
         const placeholders = g.listOpsOfType("Placeholder");
         if (!placeholders.length)
           throw new Error(`No Placeholder ops found in ${opts.modelPath}`);
-        inputOp = placeholders[0];
+        inputOps = placeholders;
       }
       if (!outputOps?.length) {
         const sinks = g.listSinkOps();
@@ -197,18 +197,18 @@ export class InferencePool {
       }
     }
 
-    // Resolve input shape from the graph's Placeholder type info.
-    const rawShape = g._native.opOutputShape(inputOp, 0) as number[] | null;
+    // Resolve input shape from the first Placeholder's type info.
+    const rawShape = g._native.opOutputShape(inputOps[0], 0) as number[] | null;
     const inputShape = rawShape
       ? rawShape.map((d: number) => (d < 0 ? null : d))
       : [null];
 
-    const rawDtype = g._native.opOutputType(inputOp!, 0) as number | null;
+    const rawDtype = g._native.opOutputType(inputOps[0], 0) as number | null;
     const inputDtype: DType = (rawDtype ?? DType.FLOAT32) as DType;
     debug(
-      `resolvedInputShape: op="${inputOp}" rawShape=${JSON.stringify(
-        rawShape,
-      )} -> ${JSON.stringify(inputShape)}`,
+      `resolvedInputShape: ops=${JSON.stringify(
+        inputOps,
+      )} rawShape=${JSON.stringify(rawShape)} -> ${JSON.stringify(inputShape)}`,
     );
 
     const hw = availableParallelism();
@@ -236,12 +236,10 @@ export class InferencePool {
     const dummyShape = (inputShape as (number | null)[]).map((d) => d ?? 1);
     const nElems = dummyShape.reduce((a, b) => a * b, 1);
     const dummyBuf = Buffer.alloc(nElems * 4);
-    const dummyFeeds = [
-      [
-        { opName: inputOp!, index: 0 },
-        { dtype: 1 as any, shape: dummyShape, data: dummyBuf },
-      ],
-    ] as any;
+    const dummyFeeds = inputOps!.map((op) => [
+      { opName: op, index: 0 },
+      { dtype: 1 as any, shape: dummyShape, data: dummyBuf },
+    ]) as any;
     const dummyFetches = (outputOps as string[]).map((op) => ({
       opName: op,
       index: 0,
@@ -503,7 +501,7 @@ export class InferencePool {
     return new InferencePool({
       graph: g,
       sess,
-      inputOp: inputOp!,
+      inputOps: inputOps!,
       outputOps: outputOps!,
       maxQueueDepth: opts.maxQueueDepth ?? 128,
       maxConcurrent,
@@ -611,12 +609,10 @@ export class InferencePool {
         inputTyped.byteLength,
       );
 
-      const feeds = [
-        [
-          { opName: this.inputOp, index: 0 },
-          { dtype: inputDtype as DType, shape: inputShape, data: inputBuf },
-        ],
-      ] as [any, FeedValue][];
+      const feeds = this.inputOps.map((op) => [
+        { opName: op, index: 0 },
+        { dtype: inputDtype as DType, shape: inputShape, data: inputBuf },
+      ]) as [any, FeedValue][];
 
       const fetches = this.outputOps.map((op) => ({ opName: op, index: 0 }));
       const outputs = await this.sess.runAsync(feeds as any, fetches as any);
