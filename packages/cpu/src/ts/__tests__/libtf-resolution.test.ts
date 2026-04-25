@@ -8,15 +8,7 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
-import { join } from "path";
-import { arch, platform } from "os";
-import { homedir, tmpdir } from "os";
-import { fileURLToPath } from "url";
-import { dirname } from "path";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { platform } from "os";
 
 describe("TensorFlow Library Resolution", () => {
   let originalLdPath: string | undefined;
@@ -39,42 +31,6 @@ describe("TensorFlow Library Resolution", () => {
       process.env.LIBTENSORFLOW_PATH = originalTfPath;
     } else {
       delete process.env.LIBTENSORFLOW_PATH;
-    }
-  });
-
-  it("should detect prebuilds directory on Linux", () => {
-    if (platform() !== "linux") {
-      console.log("Skipping Linux-specific test on non-Linux platform");
-      return;
-    }
-
-    const prebuildsDir = join(
-      __dirname,
-      "..",
-      "..",
-      "prebuilds",
-      `linux-${arch()}`,
-    );
-
-    // The prebuilds directory should exist after postinstall
-    if (existsSync(prebuildsDir)) {
-      assert.strictEqual(existsSync(prebuildsDir), true);
-      console.log(`✓ Prebuilds directory exists: ${prebuildsDir}`);
-    }
-  });
-
-  it("should maintain libtf/lib symlinks on Linux", () => {
-    if (platform() !== "linux") {
-      console.log("Skipping Linux-specific test on non-Linux platform");
-      return;
-    }
-
-    const libDir = join(__dirname, "..", "..", "libtf", "lib");
-
-    // After the fix, libtf/lib should still exist (not deleted)
-    if (existsSync(libDir)) {
-      assert.strictEqual(existsSync(libDir), true);
-      console.log(`✓ libtf/lib directory preserved: ${libDir}`);
     }
   });
 
