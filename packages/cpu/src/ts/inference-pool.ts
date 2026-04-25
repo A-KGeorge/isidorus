@@ -10,7 +10,7 @@ import { getAddon } from "./_native.js";
 import { Graph } from "./graph.js";
 import { Session } from "./session.js";
 import { debug, warn } from "./_log.js";
-import { DType } from "@isidorus/core";
+import { DType, dtypeItemSize } from "@isidorus/core";
 import type { TensorValue, FeedValue } from "./session.js";
 import type { DataLike } from "./model/easy.js";
 import { toFloat32Array, toInt32Array } from "./model/easy.js";
@@ -138,6 +138,7 @@ export class InferencePool {
   private readonly outputOps: string[];
   private readonly maxQueueDepth: number;
   private readonly _inputShape: (number | null)[];
+  private readonly _inputDtype: DType;
   private readonly modelPath: string;
 
   private active = 0;
@@ -153,6 +154,7 @@ export class InferencePool {
     maxQueueDepth: number;
     maxConcurrent: number;
     inputShape: (number | null)[];
+    inputDtype: DType;
     modelPath: string;
   }) {
     this.graph = params.graph;
@@ -162,6 +164,7 @@ export class InferencePool {
     this.maxQueueDepth = params.maxQueueDepth;
     this.maxConcurrent = params.maxConcurrent;
     this._inputShape = params.inputShape;
+    this._inputDtype = params.inputDtype;
     this.modelPath = params.modelPath;
   }
 
@@ -199,6 +202,9 @@ export class InferencePool {
     const inputShape = rawShape
       ? rawShape.map((d: number) => (d < 0 ? null : d))
       : [null];
+
+    const rawDtype = g._native.opOutputType(inputOp!, 0) as number | null;
+    const inputDtype: DType = (rawDtype ?? DType.FLOAT32) as DType;
     debug(
       `resolvedInputShape: op="${inputOp}" rawShape=${JSON.stringify(
         rawShape,
@@ -502,6 +508,7 @@ export class InferencePool {
       maxQueueDepth: opts.maxQueueDepth ?? 128,
       maxConcurrent,
       inputShape,
+      inputDtype,
       modelPath: opts.modelPath,
     });
   }
@@ -522,6 +529,10 @@ export class InferencePool {
     return this.queue.length;
   }
 
+  get resolvedInputDtype(): DType {
+    return this._inputDtype;
+  }
+
   /**
    * infer — submit an inference request.
    *
@@ -539,7 +550,7 @@ export class InferencePool {
   infer(
     inputData: DataLike,
     inputShape: number[],
-    inputDtype: number = 1,
+    inputDtype: DType = DType.FLOAT32,
   ): Promise<PoolResult> {
     if (this.destroyed)
       return Promise.reject(new Error("InferencePool has been destroyed"));
@@ -547,7 +558,7 @@ export class InferencePool {
     // Convert input data to a typed array
     let inputTyped: Float32Array | Int32Array;
     try {
-      if (inputDtype === 3) {
+      if (inputDtype === DType.INT32) {
         // INT32
         inputTyped = toInt32Array(inputData);
       } else {
@@ -588,7 +599,7 @@ export class InferencePool {
   private async _run(
     inputTyped: Float32Array | Int32Array,
     inputShape: number[],
-    inputDtype: number,
+    inputDtype: DType,
   ): Promise<PoolResult> {
     this.active++;
     const t0 = performance.now();
@@ -656,7 +667,7 @@ export class InferencePool {
   async runBatch(
     inputs: Buffer[],
     inputShape: number[],
-    inputDtype: number = 1,
+    inputDtype: DType = DType.FLOAT32,
   ): Promise<PoolResult[]> {
     if (this.destroyed) throw new Error("InferencePool has been destroyed");
     if (inputs.length === 0) return [];
