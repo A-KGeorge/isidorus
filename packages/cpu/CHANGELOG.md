@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.32
+
+### Patch Changes
+
+- b7bf2e3: Fix multi-input
+
 ## 0.0.0-alpha.31
 
 ### Patch Changes
