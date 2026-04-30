@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.33
+
+### Patch Changes
+
+- bcb12f6: Readme version bump
+
 ## 0.0.0-alpha.32
 
 ### Patch Changes
