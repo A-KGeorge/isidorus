@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.34
+
+### Patch Changes
+
+- 2dcc46e: Update correct readme
+
 ## 0.0.0-alpha.33
 
 ### Patch Changes
