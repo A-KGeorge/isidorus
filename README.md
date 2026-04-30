@@ -40,6 +40,25 @@ To prevent starvation and thrashing, Isidorus provides an `InferencePool` class 
 - **JS-level Queueing:** If a new request arrives while the concurrency limit is maxed out, the `InferencePool` intercepts it and holds it in a standard JavaScript Array on the main thread.
 - **Graceful Degradation:** Excess requests politely wait their turn. As load spikes, overall latency increases linearly (due to queueing), but the server's CPU remains at peak efficiency, context switching overhead is avoided, and Node.js stays highly responsive to standard I/O.
 
+**How does `InferencePool` know the optimal `maxConcurrent` value?**
+
+Regardless of configuration, the pool always calculates two absolute hardware limitations first:
+
+1.  **Physical Cores (`usable`):** It queries the OS for the number of physical CPU cores (or uses a strictly defined number if `reserveCores` is set).
+2.  **`libuv` Thread Pool Limit (`poolCap`):** It checks `process.env.UV_THREADPOOL_SIZE` natively and unconditionally caps `maxConcurrent` so it never exceeds the worker threads actually available to Node.js.
+
+Then, the `InferencePool` settles on the final `maxConcurrent` capability via one of three routes:
+
+- **A. Expert Mode (Explicit Configuration):** If you explicitly pass `maxConcurrent` or `intraOpThreads`, it derives the missing value using the formula `Math.floor(usable / provided_value)` to balance threads safely without oversubscribing.
+- **B. Pre-defined Profiles:**
+  - `profile="latency"` allocates all `usable` cores to a single inference (`intra=usable`, `maxConcurrent=1`) to optimize for the lowest single-request time.
+  - `profile="throughput"` statically locks threads per job to 4 (`intra=4`) and runs exactly `Math.floor(usable / 4)` jobs concurrently.
+- **C. The Autotuner (Default):** If no profile or strict numbers are set, the pool runs an internal benchmark pipeline at startup:
+  1.  **Generate Candidates:** It creates a list of potential thread configurations (e.g., 2 `intra` cores, 4 `intra` cores, etc.).
+  2.  **Warm-up:** It runs inferences using dummy tensors that exactly match your model's input shapes to pre-heat TensorFlow and oneDNN caches.
+  3.  **Stress Test:** It blasts the worker pool with continuous dummy inference calls for multiple cycles exactly at the concurrency cap, measuring the sustained requests per second (RPS) capability.
+  4.  **Pick Winner:** It selects the configuration that yielded the highest overall RPS. If two configurations tie, it smartly prefers the one with higher `intra` threads so that individual request latency remains lower while still providing maximum throughput.
+
 ## Project Structure
 
 This is a monorepo managed with npm workspaces and [Changesets](https://github.com/changesets/changesets).
