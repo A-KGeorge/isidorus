@@ -47,17 +47,35 @@ Regardless of configuration, the pool always calculates two absolute hardware li
 1.  **Physical Cores (`usable`):** It queries the OS for the number of physical CPU cores (or uses a strictly defined number if `reserveCores` is set).
 2.  **`libuv` Thread Pool Limit (`poolCap`):** It checks `process.env.UV_THREADPOOL_SIZE` natively and unconditionally caps `maxConcurrent` so it never exceeds the worker threads actually available to Node.js.
 
-Then, the `InferencePool` settles on the final `maxConcurrent` capability via one of three routes:
+Then, the `InferencePool` settles on the final `maxConcurrent` capability via the following decision tree:
 
-- **A. Expert Mode (Explicit Configuration):** If you explicitly pass `maxConcurrent` or `intraOpThreads`, it derives the missing value using the formula `Math.floor(usable / provided_value)` to balance threads safely without oversubscribing.
-- **B. Pre-defined Profiles:**
-  - `profile="latency"` allocates all `usable` cores to a single inference (`intra=usable`, `maxConcurrent=1`) to optimize for the lowest single-request time.
-  - `profile="throughput"` statically locks threads per job to 4 (`intra=4`) and runs exactly `Math.floor(usable / 4)` jobs concurrently.
-- **C. The Autotuner (Default):** If no profile or strict numbers are set, the pool runs an internal benchmark pipeline at startup:
-  1.  **Generate Candidates:** It creates a list of potential thread configurations (e.g., 2 `intra` cores, 4 `intra` cores, etc.).
-  2.  **Warm-up:** It runs inferences using dummy tensors that exactly match your model's input shapes to pre-heat TensorFlow and oneDNN caches.
-  3.  **Stress Test:** It blasts the worker pool with continuous dummy inference calls for multiple cycles exactly at the concurrency cap, measuring the sustained requests per second (RPS) capability.
-  4.  **Pick Winner:** It selects the configuration that yielded the highest overall RPS. If two configurations tie, it smartly prefers the one with higher `intra` threads so that individual request latency remains lower while still providing maximum throughput.
+```mermaid
+flowchart TD
+    Start["User Initializes InferencePool"] --> CheckExpert{"Explicit config provided?"}
+
+    CheckExpert -- Yes --> Expert["A. Expert Mode"]
+    CheckExpert -- No --> CheckProfile{"Is a profile specified?"}
+
+    CheckProfile -- Yes --> Profile["B. Pre-defined Profiles"]
+    CheckProfile -- No --> Autotune["C. The Autotuner"]
+
+    %% Expert Mode Flow
+    Expert --> HasIntra{"Both intra & maxConcurrent provided?"}
+    HasIntra -- Yes --> UseBoth["Clamp maxConcurrent to poolCap"]
+    HasIntra -- "No (Only one provided)" --> DeriveMatch["Derive missing value using Math.floor(usable / provided)"]
+
+    %% Profiles Flow
+    Profile --> ProfileType{"Which profile?"}
+    ProfileType -- "latency" --> LatencyProfile["use all cores for 1 request:<br>intra = usable<br>maxConcurrent = 1"]
+    ProfileType -- "throughput" --> ThroughputProfile["split cores:<br>intra = 4<br>maxConcurrent = Math.floor(usable / 4)"]
+
+    %% Autotuner Flow
+    Autotune --> GenCand["1. Generate Candidates: 2 intra, 4 intra..."]
+    GenCand --> Warmup["2. Warm-up: run dummy inferences to heat caches"]
+    Warmup --> Stress["3. Stress Test: run continuous models at max limit for each candidate"]
+    Stress --> Measure["Measure sustained RPS for each candidate"]
+    Measure --> Pick["4. Pick Winner: Select config with highest RPS,<br>tie-breaking with higher intra"]
+```
 
 ## Project Structure
 
