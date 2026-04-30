@@ -4,33 +4,6 @@ Isidorus is a high-performance machine learning library for Node.js featuring Te
 
 The project is named in honor of **St. Isidore of Seville**, the patron saint of the internet and computer users, who was known for his efforts to compile and preserve the world's knowledge.
 
-## Why Isidorus?
-
-### The Threading Over-Subscription Problem
-
-Integrating TensorFlow with Node.js requires solving a fundamental scheduling conflict. Both libuv (Node's event loop) and TensorFlow's thread scheduler are **greedy for CPU resources**, leading to thread over-subscription on edge devices with limited cores.
-
-### Naive Approaches Don't Work
-
-Simply wrapping TensorFlow operations in NAPI async workers (as other solutions attempt) creates several performance problems:
-
-1. **Thread Contention**: Both schedulers compete for L1/L2 cache, creating a "noisy neighbors" situation
-2. **Latency Degradation**: While throughput may appear unchanged, latency increases significantly due to cache coherency overhead
-3. **Event Loop Blocking**: TensorFlow's greedy scheduling can starve the main event loop during inference bursts
-
-This is why libraries like SciPy in Python also suffer when multithreaded at the application level—you hit the same architectural limitation.
-
-### Isidorus's Solution
-
-Isidorus uses **auto-tuning and intelligent request queueing** with `uv_queue_work` to:
-
-- **Limit TensorFlow's resource footprint** relative to libuv's static thread pool
-- **Increase the libuv thread pool size** to accommodate both base worker threads and TensorFlow threads
-- **Serialize requests intelligently** to prevent scheduler conflicts and cache thrashing
-- **Maintain event loop responsiveness** even during heavy inference workloads
-
-The key insight: understand the underlying engine (libuv + TensorFlow's scheduling internals) rather than layering abstractions that fight each other. This approach is similar to how Triton solves this for GPU workloads, but optimized for CPU-bound edge inference.
-
 ### For Production Edge ML
 
 If you're deploying ML inference on edge devices with Node.js and need both:
@@ -40,6 +13,32 @@ If you're deploying ML inference on edge devices with Node.js and need both:
 - Non-blocking event loop behavior
 
 Then Isidorus handles the hard scheduling problems you shouldn't have to solve yourself.
+
+### Architecture & Concurrency
+
+**Why the Event Loop Isn't Blocked During Inference:**
+
+The computational heavy lifting is offloaded to background threads using Node.js's native C++ addon system and the `libuv` thread pool:
+
+1. **Async Entry Point (`runAsync`):** When inference is requested, instead of executing synchronously, a standard JavaScript Promise is returned and execution is delegated to the native C++ module.
+2. **Offloading to `libuv`:** The native C++ module (`SessionWrap::RunAsync`) prepares the TensorFlow inputs but uses `uv_queue_work` to schedule the actual execution (`TF_SessionRun`) on `libuv`'s background worker pool. The main Node.js event loop immediately resumes, allowing your app to continue processing network requests.
+3. **Independent Threading:** `TF_SessionRun` executes in the background. TensorFlow uses its own highly optimized threading model (configured via `intraOpThreads`) to parallelize the math computations independent of Node.js.
+4. **Thread-Safe Completion:** Once `TF_SessionRun` finishes, it packages the tensor outputs and pushes them to a thread-safe internal queue. It then calls a Thread-Safe Function (`napi_call_threadsafe_function`) to signal the main thread.
+5. **Resolving the Promise:** The main event loop receives the signal, briefly drains the completion queue to construct the JavaScript arrays/tensors, and resolves the Javascript Promise you `await`ed earlier.
+
+**What Happens at High Traffic in a Real-Time Server?**
+
+Under high load (e.g., handling many concurrent WebSocket or HTTP requests that trigger model inference), raw TensorFlow bindings present two major threats:
+
+1. **`libuv` Thread Pool Starvation:** By default, Node.js only has 4 worker threads in the `libuv` pool. If 4 concurrent inferences occur, they occupy all 4 background threads. The main JS event loop still ticks, but any other asynchronous Node.js operations that rely on `libuv` (like reading/writing files, certain cryptography, or DNS lookups) will be stalled in a queue until an inference finishes.
+2. **CPU Thrashing:** If you try to fix starvation by increasing Node's `UV_THREADPOOL_SIZE=100` and process 100 concurrent jobs, you create a new problem. If each inference uses 4 CPU cores (`intraOpThreads`), you are requesting 400 highly active threads on a machine with limited physical cores. The OS scheduler will thrash (forcefully pausing and resuming threads), resulting in astronomical latency spikes for all requests.
+
+**The Solution: `InferencePool`**
+To prevent starvation and thrashing, Isidorus provides an `InferencePool` class that protects the system:
+
+- **Concurrency Clamping (`maxConcurrent`):** It restricts the number of active `runAsync()` calls allowed in-flight at any given moment, strictly limiting them based on your physical CPU cores and the `UV_THREADPOOL_SIZE`.
+- **JS-level Queueing:** If a new request arrives while the concurrency limit is maxed out, the `InferencePool` intercepts it and holds it in a standard JavaScript Array on the main thread.
+- **Graceful Degradation:** Excess requests politely wait their turn. As load spikes, overall latency increases linearly (due to queueing), but the server's CPU remains at peak efficiency, context switching overhead is avoided, and Node.js stays highly responsive to standard I/O.
 
 ## Project Structure
 
