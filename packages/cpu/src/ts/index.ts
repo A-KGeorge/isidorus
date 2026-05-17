@@ -191,5 +191,5 @@ export { SGD, Adam, RMSProp } from "./optimizers/index.js";
 export type { ParamSpec } from "./optimizers/index.js";
 
 // ── InferencePool ─────────────────────────────────────────────────────────────
-export type { PoolOptions, PoolResult } from "./inference-pool.js";
-export { InferencePool } from "./inference-pool.js";
+export type { PoolProfile, PoolOptions, PoolResult } from "./inference-pool.js";
+export { QueueFullError, InferencePool } from "./inference-pool.js";
