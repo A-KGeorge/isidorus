@@ -122,9 +122,9 @@ function getUvPoolSize(): number {
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 interface QueueEntry {
-  inputData: Float32Array | Int32Array;
-  inputShape: number[];
-  inputDtype: number;
+  inputData: (Float32Array | Int32Array) | (Float32Array | Int32Array)[];
+  inputShape: number[] | number[][];
+  inputDtype: DType | DType[];
   resolve: (r: PoolResult) => void;
   reject: (e: Error) => void;
 }
@@ -534,8 +534,9 @@ export class InferencePool {
   /**
    * infer — submit an inference request.
    *
-   * Runs immediately if the session is idle. Otherwise queues the request
-   * (FIFO). Throws QueueFullError synchronously if maxQueueDepth is reached.
+   * Single-input overload: Runs immediately if the session is idle. Otherwise
+   * queues the request (FIFO). Throws QueueFullError synchronously if
+   * maxQueueDepth is reached.
    *
    * Accepts data in multiple formats:
    * - Float32Array / Int32Array (fastest, zero-copy)
@@ -548,20 +549,72 @@ export class InferencePool {
   infer(
     inputData: DataLike,
     inputShape: number[],
-    inputDtype: DType = DType.FLOAT32,
+    inputDtype?: DType,
+  ): Promise<PoolResult>;
+
+  /**
+   * infer — submit an inference request.
+   *
+   * Multi-input overload: Pass multiple tensors to different input ops.
+   * All inputs must have been auto-discovered or explicitly specified via
+   * inputOp/inputOps during create(). Order must match the order ops were
+   * discovered.
+   *
+   * @param inputDataArray Array of input tensors (one per input op)
+   * @param inputShapes    Array of shapes (one per input op)
+   * @param inputDtypes    Array of dtypes (one per input op). Default: all FLOAT32.
+   */
+  infer(
+    inputDataArray: DataLike[],
+    inputShapes: number[][],
+    inputDtypes?: DType[],
+  ): Promise<PoolResult>;
+
+  infer(
+    inputData: DataLike | DataLike[],
+    inputShape: number[] | number[][],
+    inputDtype: DType | DType[] = DType.FLOAT32,
   ): Promise<PoolResult> {
     if (this.destroyed)
       return Promise.reject(new Error("InferencePool has been destroyed"));
 
-    // Convert input data to a typed array
-    let inputTyped: Float32Array | Int32Array;
+    // Detect single vs multi-input by checking if inputShape is jagged (Array of Arrays)
+    const isMultiInput = Array.isArray(inputShape[0]);
+
+    let inputTypedArray: (Float32Array | Int32Array)[];
+
     try {
-      if (inputDtype === DType.INT32) {
-        // INT32
-        inputTyped = toInt32Array(inputData);
+      if (isMultiInput) {
+        // Multi-input case
+        const shapes = inputShape as number[][];
+        const dtypes = Array.isArray(inputDtype)
+          ? (inputDtype as DType[])
+          : new Array(shapes.length).fill(inputDtype as DType);
+
+        inputTypedArray = (inputData as DataLike[]).map((data, i) => {
+          const dtype = dtypes[i] ?? DType.FLOAT32;
+          if (dtype === DType.INT32) {
+            return toInt32Array(data);
+          } else {
+            return toFloat32Array(data);
+          }
+        });
+
+        if (inputTypedArray.length !== this.inputOps.length)
+          throw new Error(
+            `Expected ${this.inputOps.length} inputs, got ${inputTypedArray.length}`,
+          );
       } else {
-        // Default to FLOAT32
-        inputTyped = toFloat32Array(inputData);
+        // Single-input case (legacy)
+        const dtype = Array.isArray(inputDtype)
+          ? (inputDtype as DType[])[0]
+          : (inputDtype as DType);
+        const dtypeVal = dtype ?? DType.FLOAT32;
+        if (dtypeVal === DType.INT32) {
+          inputTypedArray = [toInt32Array(inputData as DataLike)];
+        } else {
+          inputTypedArray = [toFloat32Array(inputData as DataLike)];
+        }
       }
     } catch (e) {
       return Promise.reject(
@@ -573,11 +626,12 @@ export class InferencePool {
     }
 
     // Dispatch immediately if a concurrent slot is available.
-    // Multiple runAsync() calls on the same session are safe — TF's inter-op
-    // scheduler overlaps independent ops across concurrent requests, which
-    // is how tfjs-node achieves sub-linear latency scaling at high concurrency.
     if (this.active < this.maxConcurrent)
-      return this._run(inputTyped, inputShape, inputDtype);
+      return this._run(
+        inputTypedArray,
+        inputShape as number[] | number[][],
+        inputDtype as DType | DType[],
+      );
 
     // All slots occupied — queue the request.
     if (this.queue.length >= this.maxQueueDepth)
@@ -585,7 +639,7 @@ export class InferencePool {
 
     return new Promise<PoolResult>((resolve, reject) => {
       this.queue.push({
-        inputData: inputTyped,
+        inputData: inputTypedArray,
         inputShape,
         inputDtype,
         resolve,
@@ -595,24 +649,42 @@ export class InferencePool {
   }
 
   private async _run(
-    inputTyped: Float32Array | Int32Array,
-    inputShape: number[],
-    inputDtype: DType,
+    inputTypedArray:
+      | (Float32Array | Int32Array)
+      | (Float32Array | Int32Array)[],
+    inputShape: number[] | number[][],
+    inputDtype: DType | DType[],
   ): Promise<PoolResult> {
     this.active++;
     const t0 = performance.now();
     try {
-      // Create a Buffer view of the typed array for TensorFlow
-      const inputBuf = Buffer.from(
-        inputTyped.buffer,
-        inputTyped.byteOffset,
-        inputTyped.byteLength,
-      );
+      // Normalize to array for uniform handling
+      const isArray = Array.isArray(inputTypedArray);
+      const typedArrays = isArray
+        ? (inputTypedArray as (Float32Array | Int32Array)[])
+        : ([inputTypedArray] as (Float32Array | Int32Array)[]);
+      const shapes = Array.isArray(inputShape[0])
+        ? (inputShape as number[][])
+        : ([inputShape] as number[][]);
+      const dtypes = Array.isArray(inputDtype)
+        ? (inputDtype as DType[])
+        : ([inputDtype] as DType[]);
 
-      const feeds = this.inputOps.map((op) => [
-        { opName: op, index: 0 },
-        { dtype: inputDtype as DType, shape: inputShape, data: inputBuf },
-      ]) as [any, FeedValue][];
+      const feeds = this.inputOps.map((op, i) => {
+        const inputBuf = Buffer.from(
+          typedArrays[i].buffer,
+          typedArrays[i].byteOffset,
+          typedArrays[i].byteLength,
+        );
+        return [
+          { opName: op, index: 0 },
+          {
+            dtype: dtypes[i] ?? DType.FLOAT32,
+            shape: shapes[i],
+            data: inputBuf,
+          },
+        ] as [any, FeedValue];
+      });
 
       const fetches = this.outputOps.map((op) => ({ opName: op, index: 0 }));
       const outputs = await this.sess.runAsync(feeds as any, fetches as any);
