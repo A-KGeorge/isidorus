@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.35
+
+### Patch Changes
+
+- 577f3b8: Exported members from inference-pool
+
 ## 0.0.0-alpha.34
 
 ### Patch Changes
