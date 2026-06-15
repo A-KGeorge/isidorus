@@ -63,7 +63,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-2022, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -91,7 +91,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-2022, macos-latest]
         node: ["20", "22", "24"]
     steps:
       - uses: actions/checkout@v4
@@ -162,7 +162,7 @@ jobs:
             tf_url_suffix: linux-x86_64.tar.gz
             tf_extract: "sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz && sudo ldconfig"
             tf_env: "LIBTENSORFLOW_PATH=/usr/local"
-          - os: windows-latest
+          - os: windows-2022
             arch: x64
             tf_url_suffix: windows-x86_64.zip
             tf_extract: 'pwsh -Command "Expand-Archive libtf.zip -DestinationPath C:\libtensorflow"'
