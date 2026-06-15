@@ -1,5 +1,11 @@
 # @isidorus/cpu
 
+## 0.0.0-alpha.36
+
+### Patch Changes
+
+- 0cc3ace: Fixed input ops
+
 ## 0.0.0-alpha.35
 
 ### Patch Changes
