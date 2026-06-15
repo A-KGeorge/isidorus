@@ -421,9 +421,27 @@ function shouldSkip(spec) {
 
 function moveLibrariesToPrebuilds(spec) {
   const os = platform();
-  if (os === "win32") return;
   const libDir = join(LIBTF_DIR, "lib");
   if (!existsSync(libDir)) return;
+
+  if (os === "win32") {
+    const prebuildsDir = join(PACKAGE_DIR, "prebuilds", "win32-x64");
+    mkdirSync(prebuildsDir, { recursive: true });
+    try {
+      let copiedCount = 0;
+      for (const file of readdirSync(libDir)) {
+        if (file.endsWith(".dll")) {
+          cpSync(join(libDir, file), join(prebuildsDir, file));
+          copiedCount++;
+        }
+      }
+      if (copiedCount > 0)
+        console.log(`  Copied ${copiedCount} DLL file(s) to prebuilds/win32-x64/`);
+    } catch (e) {
+      console.warn(`[isidorus] DLL copy warning: ${e.message}`);
+    }
+    return;
+  }
 
   const libFilePatterns =
     os === "linux"

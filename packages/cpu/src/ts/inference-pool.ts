@@ -48,6 +48,9 @@ export interface PoolOptions {
   /** Input op name. Auto-discovered from Placeholder ops if not specified. */
   inputOp?: string;
 
+  /** Input op names (multi-input models). Supersedes inputOp when set. Auto-discovered if neither is specified. */
+  inputOps?: string[];
+
   /** Output op names. Auto-discovered from sink ops if not specified. */
   outputOps?: string[];
 
@@ -179,7 +182,8 @@ export class InferencePool {
     g.importGraphDef(readFileSync(opts.modelPath));
 
     // Auto-discover inputOps and outputOps.
-    let inputOps = opts.inputOp ? [opts.inputOp] : undefined;
+    let inputOps =
+      opts.inputOps?.slice() ?? (opts.inputOp ? [opts.inputOp] : undefined);
     let outputOps = opts.outputOps?.slice();
 
     if (!inputOps || !outputOps?.length) {
@@ -557,8 +561,8 @@ export class InferencePool {
    *
    * Multi-input overload: Pass multiple tensors to different input ops.
    * All inputs must have been auto-discovered or explicitly specified via
-   * inputOp/inputOps during create(). Order must match the order ops were
-   * discovered.
+   * inputOps (or inputOp for single-input models) during create(). Order must
+   * match the order ops were discovered or specified.
    *
    * @param inputDataArray Array of input tensors (one per input op)
    * @param inputShapes    Array of shapes (one per input op)
